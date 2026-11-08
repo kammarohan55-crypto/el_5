@@ -1,0 +1,5 @@
+.venv_smoke/
+__pycache__/
+*.pyc
+smoke_test/_work/
+smoke_test/smoke_log.txt

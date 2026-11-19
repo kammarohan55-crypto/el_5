@@ -35,10 +35,10 @@ def check(src, label):
 
 def main():
     total = []
-    for f in ['prepare_data.py', 'train_landslide.py', 'build_notebook.py', 'smoke_test/unit_checks.py',
+    for f in ['prepare_data.py', 'train_landslide.py', 'ablation.py', 'build_notebook.py', 'smoke_test/unit_checks.py',
               'smoke_test/run_smoke.py', 'smoke_test/make_synthetic_cas.py']:
         total += check((ROOT / f).read_text(encoding='utf-8'), f)
-    nb_path = ROOT / 'CAS_Landslide_StructuralPrior_Kaggle.ipynb'
+    nb_path = ROOT / 'CAS_Landslide_DPFNet_Kaggle.ipynb'
     if nb_path.exists():
         nb = json.loads(nb_path.read_text(encoding='utf-8'))
         for i, c in enumerate(nb['cells']):

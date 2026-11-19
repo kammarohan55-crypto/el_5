@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-"""Builds CAS_Landslide_StructuralPrior_Kaggle.ipynb from prepare_data.py and train_landslide.py,
-so the notebook always contains exactly the tested scripts."""
+"""Builds CAS_Landslide_DPFNet_Kaggle.ipynb from prepare_data.py, train_landslide.py and ablation.py, so the
+notebook always contains exactly the tested scripts."""
 import json
 import uuid
 from pathlib import Path
 
+import ablation
+
 HERE = Path(__file__).resolve().parent
-OUT = HERE / 'CAS_Landslide_StructuralPrior_Kaggle.ipynb'
+OUT = HERE / 'CAS_Landslide_DPFNet_Kaggle.ipynb'
+SCRIPTS = ('prepare_data.py', 'train_landslide.py', 'ablation.py')
 
 
 def md(text):
@@ -19,52 +22,86 @@ def code(text):
             'outputs': [], 'source': text.strip('\n').splitlines(keepends=True)}
 
 
+def experiment_table():
+    prio = {1: 'essential', 2: 'recommended', 3: 'optional'}
+    lines = ['| ID | Subset | Experiment | Priority |', '|---|---|---|---|']
+    for e in ablation.EXPERIMENTS.values():
+        lines.append(f'| `{e["id"]}` | {e["subset"]} | {e["title"]} | {prio[e["priority"]]} |')
+    return '\n'.join(lines)
+
+
 INTRO = r'''
-# CAS Landslide segmentation — Structural-Prior UNet (Kaggle, GPU T4 x2)
+# CAS Landslide segmentation — DPF-Net experiments (Kaggle, GPU T4 x2)
 
-Trains and evaluates a ConvNeXt-UNet with a **GPU-native spectral-structural prior**, a **boundary head**,
-**deep supervision** and **hard-negative pixel contrastive learning** on the CAS Landslide Dataset
-(Xu et al., *Sci. Data* 2024; Zenodo 10294997).
+**DPF-Net (Dual-Prior Fusion Network)**: a ConvNeXt-T (DINOv3) UNet that combines
 
-* **SAT**: identical public test split as SC-Net (Song et al., *Remote Sens.* 2026; 5,204 train / 2,218 test).
-  Benchmarks: Sci-Data DeepLabv3+ IoU 68.14; SC-Net IoU 79.76.
-* **UAV**: seeded 7:3 split per region (written to `/kaggle/working/splits/UAV`). Benchmarks: MFFENet 84.38; SC-Net 89.89.
+* a **spectral-structural prior**: 10 differentiable descriptors that feed a high-resolution stem;
+* a **semantic prior**: multi-layer features of a **frozen satellite foundation model** (DINOv3 ViT-L/16, SAT-493M),
+  injected into the 1/8, 1/16 and 1/32 encoder features by **structure-aware gated fusion**;
+* **semantic hard-negative mining**: anchors of the pixel-contrastive loss chosen both by the current prediction
+  errors and by foundation-model similarity to landslides (bare soil, river beds, roads, ...);
+* **DPF-Lite**: the same foundation model used only during training (feature distillation + mining), so it adds no
+  inference cost.
 
-**Before running**
-1. *Settings → Accelerator → GPU T4 x2*, *Settings → Internet → On* (to download the pretrained encoder and the SC-Net split CSVs).
-2. *Add Input →* dataset **`ngxunninh/cas-landslide`** (or any copy of Zenodo 10294997 with the original region folders).
-3. Edit the CONFIG cell, then *Save Version → Save & Run All (Commit)*. A full 80-epoch SAT run takes roughly 3–7 h.
-4. Results: `/kaggle/working/runs/<RUN_NAME>/results.md` (also printed at the end of this notebook).
+`--fm none` reproduces the earlier SP-UNet bit for bit.
+
+**One notebook, all experiments.** Each *Save & Run All* trains the experiments in `QUEUE`, in order, until the 12 h
+session is nearly used up. Every run checkpoints. To continue in a new session, attach this notebook's previous
+output as an input and run again: finished runs are carried forward, an unfinished run resumes from its checkpoint,
+and the tables and figures are rebuilt from everything found.
+
+### Before running
+1. *Settings → Accelerator → GPU T4 x2*, *Settings → Internet → On*.
+2. *Add Input →* dataset **`ngxunninh/cas-landslide`**.
+3. From the 2nd session on: *Add Input → Your Work →* this notebook (its latest output).
+4. Optional, to reuse your earlier SP-UNet runs as rows A3 / U3 without retraining: *Add Input →* the notebook
+   versions that produced them, then set `IMPORT` in CONFIG. They are re-evaluated (≈20 min each), not retrained.
+5. Edit CONFIG → *Save Version → Save & Run All (Commit)*.
+
+### Experiments
+EXPERIMENT_TABLE
+
+All rows share the encoder, the 80-epoch schedule, seed 42 and the evaluation protocol. The protocol: the
+checkpoint, the decision threshold and the TTA mode are chosen on validation only; the ablation table compares D4-TTA
+at the validation threshold.
+
+**Cost.** Runs without a foundation model (A0–A3, U0, U3) take as long as your earlier SP-UNet runs. Runs with the
+ViT-L foundation model take about 1.3–1.6× longer, because they add one frozen forward pass per image. UAV runs take
+about 1.8× longer than SAT runs. After epoch 1 the log prints the measured epoch time and the projected total. A run
+that does not fit in a session pauses and resumes in the next one.
+
+Suggested order: `A6` (main SAT result) → `A0`, `A5`, `A7` → `U6` (main UAV result) → `A4`, `A8`, `A9` → `A1`,
+`A2` → `S1`, `S2`, `U0`, `U8`. Import `A3` / `U3` from your SP-UNet runs. With two Kaggle accounts, give each a
+different `QUEUE`, then run the collect cell on all outputs.
 '''
 
 CONFIG = r'''
+import time
+NB_T0 = time.time()          # session start - the queue keeps every run inside the 12 h Kaggle limit
 # ================================ CONFIG ================================
-SUBSET = 'SAT'              # 'SAT' (public SC-Net split) or 'UAV' (seeded 7:3 split per region)
-RUN_NAME = 'sat_spunet_convnext_t_dinov3'
-ENCODER = 'convnext_tiny.dinov3_lvd1689m'   # or 'convnext_tiny.fb_in22k_ft_in1k', 'convnext_small.dinov3_lvd1689m',
-                                            #    'regnety_064.ra3_in1k' (SC-Net's backbone family)
-FALLBACK_ENCODER = 'convnext_tiny.fb_in22k_ft_in1k'
-EPOCHS = 80 if SUBSET == 'SAT' else 40
-BATCH_PER_GPU = 8           # global batch = BATCH_PER_GPU x number of GPUs (16 on T4 x2)
-SEED = 42
-FULL_TRAIN = False          # True: train on train+val with the fixed schedule, evaluate the final EMA weights
-EXTRA_ARGS = ''             # ablations, e.g. '--no-hires --no-prior --boundary-weight 0 --contrast-weight 0'
-RESUME = ''                 # e.g. '/kaggle/input/<previous-version-output>/runs/<RUN_NAME>/last.pth'
-MAX_TRAIN_HOURS = 10.5      # Kaggle stops sessions at 12 h; training checkpoints and stops before this budget
-QUICK_TEST = False          # True: 1 epoch on the full data to measure epoch time / memory before the real run
+QUEUE = ['A6']               # experiment ids, run in this order (table above); e.g. ['A6', 'A0', 'A5']
+EPOCHS = 80                  # identical for every row (the SP-UNet results used 80)
+BATCH_PER_GPU = 8            # global batch = 16 on T4 x2; use 6 if CUDA runs out of memory
+SESSION_HOURS = 11.5         # Kaggle stops sessions at 12 h; the queue stops cleanly before this
+EXTRA_ARGS = ''              # appended to every run, e.g. '--grad-ckpt'
+IMPORT = {}                  # reuse finished SP-UNet checkpoints instead of retraining, e.g.
+# IMPORT = {'A3': '/kaggle/input/<sat-notebook>/runs/sat_spunet_convnext_t_dinov3_fp32_rerun/best.pth',
+#           'U3': '/kaggle/input/<uav-notebook>/runs/sat_spunet_convnext_t_dinov3_fp32_rerun/best.pth'}
+QUICK_TEST = False           # True: 1 epoch of QUEUE[0] (+ its evaluation) to measure time and memory
 WORK = '/kaggle/working'
+PREV = ['/kaggle/input']     # earlier outputs attached as inputs are found here automatically
 '''
 
 ENV = r'''
-import os, sys, json, shlex, subprocess, time
+import os, sys, json, glob, shlex, subprocess
 import torch
 
 def run(args, env=None):
-    """Run a command (list of arguments, no shell) and stream its output into the notebook; raise on failure."""
+    """Run a command (argument list, no shell), stream its output into the notebook, raise on failure."""
     args = [str(x) for x in args]
     print('$', ' '.join(shlex.quote(x) for x in args), flush=True)
     p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
-                         env={**os.environ, **(env or {})})
+                         encoding='utf-8', errors='replace', env={**os.environ, **(env or {})})
     for line in p.stdout:
         print(line, end='', flush=True)
     rc = p.wait()
@@ -76,99 +113,68 @@ N_GPU = torch.cuda.device_count()
 print('GPUs:', N_GPU, [torch.cuda.get_device_name(i) for i in range(N_GPU)])
 if N_GPU == 0:
     raise SystemExit('No GPU visible: Settings -> Accelerator -> GPU T4 x2')
-try:
-    import timm
-except ImportError:
-    run([sys.executable, '-m', 'pip', 'install', '-q', 'timm'])
-    import timm
-print('timm', timm.__version__)
+
+# timm >= 1.0.20 is needed for the DINOv3 models; checked in a fresh interpreter so an upgrade takes effect
+CHECK = ("import sys, timm; have = set(timm.list_pretrained('*dinov3*')); "
+         "need = ['convnext_tiny.dinov3_lvd1689m', 'vit_large_patch16_dinov3.sat493m']; "
+         "print('timm', timm.__version__); sys.exit(0 if all(n in have for n in need) else 3)")
+if subprocess.run([sys.executable, '-c', CHECK]).returncode != 0:
+    run([sys.executable, '-m', 'pip', 'install', '-q', '-U', 'timm>=1.0.20'])
+    if subprocess.run([sys.executable, '-c', CHECK]).returncode != 0:
+        raise SystemExit('timm does not provide the DINOv3 models even after upgrading (Internet must be On).')
+
+# download the encoder and the foundation-model weights once (ViT-L: 1.2 GB), so every process finds them cached
+run([sys.executable, f'{WORK}/ablation.py', 'weights', '--queue', *QUEUE, f'--extra={EXTRA_ARGS}'])
+run([sys.executable, f'{WORK}/ablation.py', 'list'])
+'''
+
+RUN = r'''
+# Train + evaluate the queued experiments (DDP on all GPUs). Safe to re-run: finished runs are skipped.
+cmd = [sys.executable, f'{WORK}/ablation.py', 'run', '--work', WORK, '--queue', *QUEUE, '--epochs', EPOCHS,
+       '--batch-size', BATCH_PER_GPU, '--session-hours', SESSION_HOURS, '--t0', NB_T0, f'--extra={EXTRA_ARGS}',
+       '--prev', *PREV]
+if IMPORT:
+    cmd += ['--import'] + [f'{k}={v}' for k, v in IMPORT.items()]
 if QUICK_TEST:
-    EPOCHS, RUN_NAME = 1, RUN_NAME + '_quick'
-
-# Download the pretrained encoder once (Internet ON) so that both training processes find it in the cache.
-try:
-    _m = timm.create_model(ENCODER, pretrained=True, features_only=True); del _m
-    print('encoder weights OK:', ENCODER)
-except Exception as e:
-    print(f'!! could not load {ENCODER}: {type(e).__name__}: {e}')
-    print(f'!! falling back to {FALLBACK_ENCODER} (recorded in results.json)')
-    ENCODER = FALLBACK_ENCODER
-    try:
-        _m = timm.create_model(ENCODER, pretrained=True, features_only=True); del _m
-    except Exception as e2:
-        raise SystemExit(f'Cannot download pretrained weights ({e2}). Turn Settings -> Internet -> On.')
-'''
-
-PREP = r'''
-# Build the split CSVs (finds the CAS region folders below /kaggle/input automatically)
-run([sys.executable, f'{WORK}/prepare_data.py', '--subset', SUBSET, '--out', f'{WORK}/splits'])
-'''
-
-TRAIN = r'''
-# Train on all GPUs with DDP, then evaluate (validation-selected EMA weights, D4-TTA, val-selected threshold)
-args = ['--splits', f'{WORK}/splits/{SUBSET}', '--out', f'{WORK}/runs/{RUN_NAME}', '--encoder', ENCODER,
-        '--epochs', EPOCHS, '--batch-size', BATCH_PER_GPU, '--seed', SEED, '--max-train-hours', MAX_TRAIN_HOURS]
-if FULL_TRAIN:
-    args.append('--full-train')
-if RESUME:
-    args += ['--resume', RESUME]
-args += shlex.split(EXTRA_ARGS)
-launcher = ([sys.executable, '-m', 'torch.distributed.run', '--standalone', f'--nproc_per_node={N_GPU}']
-            if N_GPU > 1 else [sys.executable])
+    cmd.append('--quick')
 t0 = time.time()
-run(launcher + [f'{WORK}/train_landslide.py'] + args,
-    env={'NCCL_P2P_DISABLE': '1', 'NCCL_IB_DISABLE': '1', 'OMP_NUM_THREADS': '2'})
-print(f'finished in {(time.time() - t0) / 3600:.2f} h')
+run(cmd)
+print(f'queue finished in {(time.time() - t0) / 3600:.2f} h')
 '''
 
-RESULTS = r'''
+COLLECT = r'''
+# Ablation / comparison tables, paired-bootstrap significance tests, per-region tables and figures
+run([sys.executable, f'{WORK}/ablation.py', 'collect', '--roots', f'{WORK}/runs', *PREV, '--out', f'{WORK}/ablation'])
 from IPython.display import Markdown, Image, display
-res_dir = f'{WORK}/runs/{RUN_NAME}'
-display(Markdown(open(f'{res_dir}/results.md', encoding='utf-8').read()))
-vis = sorted(os.listdir(f'{res_dir}/vis_test')) if os.path.isdir(f'{res_dir}/vis_test') else []
-for f in vis[:4]:   # RGB | ground truth | errors (TP green, FP red, FN blue)
-    display(Image(filename=f'{res_dir}/vis_test/{f}'))
-print('files:', sorted(os.listdir(res_dir)))
+for tag in QUEUE:
+    f = f'{WORK}/runs/{tag}/results.md'
+    if os.path.exists(f):
+        display(Markdown(open(f, encoding='utf-8').read()))
+for f in sorted(glob.glob(f'{WORK}/ablation/fig_*.png')):
+    display(Image(filename=f))
+print('download for the paper:', sorted(os.listdir(f'{WORK}/ablation')))
 '''
 
 NEXT = r'''
-## Next steps
+## After the run
 
-* **Resume** a run stopped by the time budget: open a new version of this notebook, *Add Input → Your Work →* the
-  previous version's output, set `RESUME = '/kaggle/input/.../runs/<RUN_NAME>/last.pth'` (keep all other settings) and
-  *Save & Run All*. The best checkpoint and the history are carried over.
-* **Ablations for the paper** (one run each; set `EXTRA_ARGS` and a new `RUN_NAME`):
-
-| Row | `EXTRA_ARGS` |
-|---|---|
-| UNet + PPM baseline | `--no-hires --no-prior --boundary-weight 0 --contrast-weight 0` |
-| + high-resolution stem (RGB) | `--no-prior --boundary-weight 0 --contrast-weight 0` |
-| + spectral-structural prior | `--boundary-weight 0 --contrast-weight 0` |
-| + boundary head | `--contrast-weight 0` |
-| + hard-negative contrast (full) | *(empty)* |
-
-  TTA is reported separately in every `results.md` (no-TTA and D4-TTA rows).
-* **Pretraining ablation**: `ENCODER = 'convnext_tiny.fb_in22k_ft_in1k'`; **SC-Net backbone**: `'regnety_064.ra3_in1k'`.
-* **Seeds**: repeat the full model with `SEED = 1, 2, 3` and report mean ± std.
-* **Ensemble** of finished runs (attach their outputs as inputs, run the CONFIG/setup/prepare cells, then in a new cell):
-  `run([sys.executable, '-m', 'torch.distributed.run', '--standalone', f'--nproc_per_node={N_GPU}', f'{WORK}/train_landslide.py', '--eval-only', '--splits', f'{WORK}/splits/{SUBSET}', '--out', f'{WORK}/runs/ensemble', '--eval-ckpts', '/kaggle/input/.../best.pth', '/kaggle/input/.../best.pth'], env={'NCCL_P2P_DISABLE': '1', 'NCCL_IB_DISABLE': '1'})`
+* **Continue the queue**: open a new version, *Add Input → Your Work →* this notebook's latest output, keep or extend
+  `QUEUE`, *Save & Run All*. Finished runs are not repeated.
+* **What to keep for the paper**: `/kaggle/working/ablation/` holds `ablation.md`, `ablation_table.csv` / `.tex`,
+  `summary.json`, `per_region_*.csv` and `fig_*.png` / `.pdf`. Each run keeps `results.md` / `results.json`,
+  `history.json`, `per_tile_test.csv`, `best.pth` and `vis_test/`.
+* **Two accounts**: run different queues, download each `runs/<ID>` folder (the small files are enough), put them in
+  one folder and run locally: `python ablation.py collect --roots <folder> --out ablation`.
+* **Single custom run**: `python train_landslide.py --help` lists every option. `--fm none` gives SP-UNet,
+  `--fm-mode distill` gives DPF-Lite, and `--ms-tta` adds multi-scale TTA (chosen on validation).
 '''
 
 
 def main():
-    prep_src = (HERE / 'prepare_data.py').read_text(encoding='utf-8')
-    train_src = (HERE / 'train_landslide.py').read_text(encoding='utf-8')
-    cells = [
-        md(INTRO),
-        code(CONFIG),
-        code(ENV),
-        code('%%writefile /kaggle/working/prepare_data.py\n' + prep_src),
-        code('%%writefile /kaggle/working/train_landslide.py\n' + train_src),
-        code(PREP),
-        code(TRAIN),
-        code(RESULTS),
-        md(NEXT),
-    ]
+    srcs = {s: (HERE / s).read_text(encoding='utf-8') for s in SCRIPTS}
+    cells = [md(INTRO.replace('EXPERIMENT_TABLE', experiment_table())), code(CONFIG)]
+    cells += [code(f'%%writefile /kaggle/working/{s}\n' + srcs[s]) for s in SCRIPTS]
+    cells += [code(ENV), code(RUN), code(COLLECT), md(NEXT)]
     nb = {
         'cells': cells,
         'metadata': {
@@ -183,9 +189,9 @@ def main():
     OUT.write_text(json.dumps(nb, indent=1, ensure_ascii=False) + '\n', encoding='utf-8')
     # self-check: the embedded scripts are byte-identical to the source files
     back = json.loads(OUT.read_text(encoding='utf-8'))
-    srcs = [''.join(c['source']) for c in back['cells'] if c['cell_type'] == 'code']
-    assert srcs[2] == '%%writefile /kaggle/working/prepare_data.py\n' + prep_src.strip('\n')
-    assert srcs[3] == '%%writefile /kaggle/working/train_landslide.py\n' + train_src.strip('\n')
+    code_srcs = [''.join(c['source']) for c in back['cells'] if c['cell_type'] == 'code']
+    for s in SCRIPTS:
+        assert f'%%writefile /kaggle/working/{s}\n' + srcs[s].strip('\n') in code_srcs, s
     print(f'wrote {OUT} ({OUT.stat().st_size / 1024:.0f} KB, {len(cells)} cells)')
 
 

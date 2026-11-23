@@ -63,7 +63,8 @@ def main():
     common = ['--encoder', 'convnext_atto', '--no-pretrained', '--img-size', '64', '--batch-size', '4',
               '--workers', '0', '--save-vis', '4', '--log-every', '5']
     spu = common + ['--fm', 'none']      # SP-UNet configuration
-    fm = common + ['--fm', TINY_FM]      # DPF-Net configuration with a tiny random foundation model
+    fm = common + ['--fm', TINY_FM]      # DPF-Net v2 (prior hallucination) with a tiny random foundation model
+    fm1v = common + ['--fm', TINY_FM, '--fm-sub', 'none', '--hard-mining', 'error+fm']  # v1 DPF-Net
 
     # 1. data preparation -------------------------------------------------------------
     run([PY, ROOT / 'prepare_data.py', '--subset', 'SAT', '--input-root', data, '--out', splits,
@@ -133,6 +134,16 @@ def main():
          '--max-train-hours', '0', *spu])
     g = load(runs / 'guard' / 'results.json')
     expect(g['schedule_complete'] is False and (runs / 'guard' / 'final.pth').exists(), 'time guard stops and still evaluates')
+    run([PY, ROOT / 'train_landslide.py', *sat, '--out', runs / 'prec', '--epochs', '2', '--debug-limit', '40',
+         '--debug-overflow-every', '2', '--fp32-switch-frac', '0.2', *spu])
+    hp = load(runs / 'prec' / 'history.json')
+    expect([x['fp32_recomputes'] for x in hp] == [5, 0] and [x['fp32_mode'] for x in hp] == [True, True]
+           and all(x['val']['iou'] >= 0 for x in hp), 'precision guard: overflowing steps recomputed, then switch to FP32')
+    import torch
+    ck = torch.load(runs / 'prec' / 'last.pth', map_location='cpu', weights_only=True)
+    bn_ok = all(bool(torch.isfinite(v).all()) for k, v in ck['ema']['module'].items() if 'running' in k)
+    expect(ck['precision_state'] == {'fp32_now': True, 'fp32_recomputes': 5} and bn_ok,
+           'precision guard: state saved for resume, EMA BatchNorm statistics finite')
 
     # 6. DPF-Net: foundation-model fusion, multi-scale TTA, DPF-Lite, pause / resume, eval-only ----
     run([PY, ROOT / 'train_landslide.py', *sat, '--out', runs / 'fm1', '--epochs', '2', '--debug-limit', '40',
@@ -142,14 +153,31 @@ def main():
            'fm1: no-TTA, D4-TTA and D4+MS-TTA evaluated')
     expect(f1['tta_mode'] in ('TTA', 'MSTTA') and f1['main_key'] == f'test_{f1["tta_mode"]}@t*'
            and f1['ablation_key'] == 'test_TTA@t*', f'fm1: main setting chosen on validation ({f1["tta_mode"]})')
-    expect(f1['model_stats']['fm_frozen_params_M'] > 5 and f1['args']['hard_mining'] == 'error+fm',
-           'fm1: frozen foundation model counted, error+fm mining')
+    expect(f1['model_stats']['fm_frozen_params_M'] > 5 and f1['args']['hard_mining'] == 'error'
+           and f1['args']['fm_sub'] == 'hal', 'fm1: frozen foundation model counted, prior hallucination, error mining')
+    expect(all(k in f1 for k in ('test_noTTA-lite@0.5', 'test_TTA-lite@t*', 'test_MSTTA-lite@t*', 'val_TTA-lite@t*'))
+           and f1['lite_key'] == f'test_{f1["tta_mode_lite"]}@t*' and f1['lite_ablation_key'] == 'test_TTA-lite@t*'
+           and f1['inference_variants'] == ['full', 'lite'], 'fm1: also evaluated without the foundation model (lite)')
+    sl = f1['model_stats_lite']
+    expect(sl['inference_params_lite_M'] < f1['model_stats']['inference_params_M'] and sl['gflops'] < f1['model_stats']['gflops'],
+           f'fm1: lite inference is cheaper ({sl["gflops"]:.2f} vs {f1["model_stats"]["gflops"]:.2f} GFLOPs)')
+    hf = load(runs / 'fm1' / 'history.json')
+    expect(all(x['val_lite'] is not None for x in hf), 'fm1: validation IoU without the FM logged every epoch')
     pt = tiles_csv(runs / 'fm1' / 'per_tile_test.csv')
-    expect(len(pt) == 40 and {'noTTA_tp', 'TTA_tp', 'MSTTA_tp'} <= set(pt[0])
-           and abs(sum(float(x['MSTTA_tp']) for x in pt) - f1['test_MSTTA@t*']['tp']) < 0.5,
-           'fm1: per-tile counts for every TTA mode')
+    expect(len(pt) == 40 and {'noTTA_tp', 'TTA_tp', 'MSTTA_tp', 'TTA-lite_tp', 'MSTTA-lite_tp'} <= set(pt[0])
+           and abs(sum(float(x['MSTTA_tp']) for x in pt) - f1['test_MSTTA@t*']['tp']) < 0.5
+           and abs(sum(float(x['TTA-lite_tp']) for x in pt) - f1['test_TTA-lite@t*']['tp']) < 0.5,
+           'fm1: per-tile counts for every TTA mode, with and without the FM')
     md = (runs / 'fm1' / 'results.md').read_text(encoding='utf-8')
-    expect('semantic prior' in md and '(main)' in md and 'D4+MS-TTA' in md, 'fm1: results.md describes DPF-Net')
+    expect('semantic prior' in md and '(main)' in md and 'D4+MS-TTA' in md and 'no FM at inference' in md
+           and 'prior hallucination' in md, 'fm1: results.md describes DPF-Net v2 with and without the FM')
+    run([PY, ROOT / 'train_landslide.py', *sat, '--out', runs / 'fmv1', '--epochs', '1', '--debug-limit', '40', *fm1v])
+    v1 = load(runs / 'fmv1' / 'results.json')
+    expect('lite_key' not in v1 and v1['inference_variants'] == ['default'] and v1['args']['fm_sub'] == 'none',
+           'v1 DPF-Net (--fm-sub none) is evaluated with the foundation model only')
+    run([PY, ROOT / 'train_landslide.py', *sat, '--out', runs / 'fmz', '--epochs', '1', '--debug-limit', '40',
+         '--fm-sub', 'zero', *fm])
+    expect('test_TTA-lite@t*' in load(runs / 'fmz' / 'results.json'), 'prior dropout run evaluated with and without the FM')
     expect(load(runs / 'fm1' / 'status.json')['evaluated'] is True, 'fm1: status.json written')
     run([PY, ROOT / 'train_landslide.py', *sat, '--out', runs / 'lite', '--epochs', '1', '--debug-limit', '40',
          '--fm-mode', 'distill', *fm])
@@ -170,8 +198,9 @@ def main():
     ev = load(runs / 'fm1_eval' / 'results.json')
     expect(ev['model_args']['fm'] == TINY_FM and ev['eval_only'] is True, 'eval-only records the trained model args')
     expect(abs(ev['thresholds']['TTA'] - f1['thresholds']['TTA']) < 1e-9
-           and abs(ev['test_TTA@t*']['iou'] - f1['test_TTA@t*']['iou']) < 1e-9,
-           'eval-only reproduces the D4-TTA threshold and test IoU of the training run')
+           and abs(ev['test_TTA@t*']['iou'] - f1['test_TTA@t*']['iou']) < 1e-9
+           and abs(ev['test_TTA-lite@t*']['iou'] - f1['test_TTA-lite@t*']['iou']) < 1e-9,
+           'eval-only reproduces the thresholds and test IoUs of the training run (with and without the FM)')
 
     # 7. ablation queue: run, pause, carry forward + resume in a "new session", import --------------
     q1, q2 = WORK / 'q1', WORK / 'q2'
@@ -182,33 +211,38 @@ def main():
              '--log-every', '5', '--debug-limit', '40']
     qrun = [PY, ROOT / 'ablation.py', 'run', '--epochs', '2', '--batch-size', '4', '--eval-reserve-hours', '0',
             '--min-start-hours', '0', '--fm-map', *FM_MAP, prep]
-    run(qrun + ['--work', q1, '--prev', '--queue', 'A0', '--extra=' + ' '.join(extra)])
-    expect(load(q1 / 'runs' / 'A0' / 'results.json')['tag'] == 'A0' and not (q1 / 'runs' / 'A0' / 'last.pth').exists(),
-           'queue: A0 finished, last.pth of a finished run removed')
-    run(qrun + ['--work', q1, '--prev', '--queue', 'A0', 'A6', 'A5',
+    run(qrun + ['--work', q1, '--prev', '--queue', 'B0', '--extra=' + ' '.join(extra)])
+    expect(load(q1 / 'runs' / 'B0' / 'results.json')['tag'] == 'B0' and not (q1 / 'runs' / 'B0' / 'last.pth').exists(),
+           'queue: B0 finished, last.pth of a finished run removed')
+    run(qrun + ['--work', q1, '--prev', '--queue', 'B0', 'B6', 'B5',
                 '--extra=' + ' '.join(extra + ['--stop-after-epochs', '1'])])
-    expect(load(q1 / 'runs' / 'A6' / 'status.json')['schedule_complete'] is False
-           and not (q1 / 'runs' / 'A5').exists(), 'queue: A6 paused by the session budget, A5 not started')
-    run(qrun + ['--work', q2, '--prev', q1, '--queue', 'A0', 'A6', 'A3', '--import', f'A3={runs / "r1" / "best.pth"}',
+    expect(load(q1 / 'runs' / 'B6' / 'status.json')['schedule_complete'] is False
+           and not (q1 / 'runs' / 'B5').exists(), 'queue: B6 paused by the session budget, B5 not started')
+    run(qrun + ['--work', q2, '--prev', q1, '--queue', 'B0', 'B6', 'B3', 'R3',
+                '--import', f'B3={runs / "r1b" / "best.pth"}', f'R3={runs / "r1" / "best.pth"}',
                 '--extra=' + ' '.join(extra)])
-    a6 = load(q2 / 'runs' / 'A6' / 'results.json')
-    expect([x['epoch'] for x in load(q2 / 'runs' / 'A6' / 'history.json')] == [1, 2] and a6['schedule_complete'] is True
-           and a6['args']['fm'] == TINY_FM and 'test_MSTTA@t*' in a6, 'new session: A6 carried forward and resumed')
-    expect((q2 / 'runs' / 'A0' / 'results.json').exists(), 'new session: finished A0 carried forward')
-    a3 = load(q2 / 'runs' / 'A3' / 'results.json')
-    expect(a3['tag'] == 'A3' and a3['model_args']['fm'] == 'none' and (q2 / 'runs' / 'A3' / 'per_tile_test.csv').exists(),
-           'import: SP-UNet checkpoint evaluated as A3')
-    run(qrun + ['--work', q2, '--prev', '--queue', 'A5', '--session-hours', '0', '--extra=' + ' '.join(extra)])
-    expect(not (q2 / 'runs' / 'A5').exists(), 'queue: no time left -> nothing started')
+    b6 = load(q2 / 'runs' / 'B6' / 'results.json')
+    expect([x['epoch'] for x in load(q2 / 'runs' / 'B6' / 'history.json')] == [1, 2] and b6['schedule_complete'] is True
+           and b6['args']['fm'] == TINY_FM and 'test_TTA-lite@t*' in b6, 'new session: B6 carried forward and resumed')
+    expect((q2 / 'runs' / 'B0' / 'results.json').exists(), 'new session: finished B0 carried forward')
+    b3 = load(q2 / 'runs' / 'B3' / 'results.json')
+    expect(b3['tag'] == 'B3' and b3['model_args']['fm'] == 'none' and (q2 / 'runs' / 'B3' / 'per_tile_test.csv').exists()
+           and (q2 / 'runs' / 'R3' / 'results.json').exists(), 'import: SP-UNet checkpoints evaluated as B3 and R3')
+    run(qrun + ['--work', q2, '--prev', '--queue', 'B5', '--session-hours', '0', '--extra=' + ' '.join(extra)])
+    expect(not (q2 / 'runs' / 'B5').exists(), 'queue: no time left -> nothing started')
     expect(len(load(q2 / 'queue_log.json')) == 2, 'queue log kept')
 
     # 8. collect: tables, significance, figures ------------------------------------------------------
     run([PY, ROOT / 'ablation.py', 'collect', '--roots', q2 / 'runs', '--out', q2 / 'ablation', '--n-boot', '300'])
     md = (q2 / 'ablation' / 'ablation.md').read_text(encoding='utf-8')
     sm = load(q2 / 'ablation' / 'summary.json')
-    expect(all(f'| {t} |' in md for t in ('A0', 'A3', 'A6')) and 'Paired bootstrap' in md, 'collect: ablation table')
-    expect({(p['reference'], p['candidate']) for p in sm['pairs']} >= {('A3', 'A6'), ('A0', 'A6')},
-           'collect: paired bootstrap A3->A6 and A0->A6')
+    expect(all(f'| {t} |' in md for t in ('B0', 'B3', 'B6', 'B6:lite', 'R3')) and 'Paired bootstrap' in md
+           and 'without the FM at inference' in md, 'collect: ablation table with the no-FM row of B6')
+    expect({(p['reference'], p['candidate']) for p in sm['pairs']} >= {('B3', 'B6'), ('B3', 'B6:lite'), ('B6:lite', 'B6'),
+                                                                       ('B0', 'B6'), ('R3', 'B3')},
+           'collect: paired bootstrap B3->B6, B3->B6:lite, B6:lite->B6, B0->B6, R3->B3')
+    expect(sm['runs']['B6:lite']['inference_params_M'] < sm['runs']['B6']['inference_params_M']
+           and sm['runs']['B6']['precision'] == 'auto', 'collect: lite row uses the lite model statistics')
     expect(all((q2 / 'ablation' / f).exists() for f in ('ablation_table.csv', 'ablation_table.tex', 'per_region_SAT.csv',
                                                          'fig_ablation_SAT.png', 'fig_per_region_SAT.pdf',
                                                          'fig_val_curves_SAT.png')), 'collect: CSV / LaTeX / figures')
@@ -216,7 +250,7 @@ def main():
     # 9. two-process DDP with the foundation model (gloo, CPU) ---------------------------------------
     if not a.skip_ddp:
         ddp_args = [ROOT / 'train_landslide.py', *sat, '--out', runs / 'ddp', '--epochs', '2', '--debug-limit', '41',
-                    '--ms-tta', *fm]
+                    '--ms-tta', '--debug-overflow-every', '3', *fm]
         if os.name == 'nt':
             # Windows PyTorch builds lack libuv and torchrun's launcher store ignores USE_LIBUV, so start the two
             # ranks with exactly the environment torchrun would set (Kaggle/Linux uses torchrun --standalone).
@@ -237,8 +271,11 @@ def main():
         expect(abs(tot['tp'] + tot['fp'] + tot['fn'] + tot['tn'] - 41 * 64 * 64) < 0.5,
                'DDP evaluation counts every test pixel exactly once (41 tiles, odd split)')
         pt = tiles_csv(runs / 'ddp' / 'per_tile_test.csv')
-        expect(len(pt) == 41 and abs(sum(float(x['MSTTA_tp']) for x in pt) - dd['test_MSTTA@t*']['tp']) < 0.5,
-               'DDP per-tile counts gathered from both ranks')
+        expect(len(pt) == 41 and abs(sum(float(x['MSTTA_tp']) for x in pt) - dd['test_MSTTA@t*']['tp']) < 0.5
+               and abs(sum(float(x['TTA-lite_tp']) for x in pt) - dd['test_TTA-lite@t*']['tp']) < 0.5,
+               'DDP per-tile counts gathered from both ranks (with and without the FM)')
+        hd = load(runs / 'ddp' / 'history.json')
+        expect(sum(x['fp32_recomputes'] for x in hd) >= 2, 'DDP: overflowing steps recomputed in step on both ranks')
     print('\nALL SMOKE TESTS PASSED', flush=True)
 
 

@@ -74,6 +74,15 @@ def test_tta():
     ms = T.predict_modes(PixelModel(), c, ('MSTTA',), False, False, (0.75, 1.0, 1.25))['MSTTA']
     check('MS-TTA on a constant image is exact', torch.allclose(ms, torch.full_like(ms, 0.3), atol=1e-5)
           and tuple(ms.shape) == (2, 1, 64, 64))
+    class PriorModel(nn.Module):
+        def forward(self, x, prior=None):
+            v = 0.8 if prior == 'lite' else 0.2
+            return {'seg': torch.logit(torch.full((x.shape[0], 1, *x.shape[-2:]), v))}
+
+    pl = T.predict_modes(PriorModel(), x, ('noTTA', 'TTA'), False, False, prior='lite')
+    pd = T.predict_modes(PriorModel(), x, ('TTA',), False, False)
+    check('predict_modes passes the prior to the model', torch.allclose(pl['TTA'], torch.full_like(pl['TTA'], 0.8))
+          and torch.allclose(pd['TTA'], torch.full_like(pd['TTA'], 0.2)))
     calls = []
 
     class SizeSpy(nn.Module):
@@ -196,11 +205,17 @@ def test_encoders_and_model(download):
         ok = all(f.shape[-1] == 64 // r and f.shape[1] == c for f, r, c in zip(feats, (4, 8, 16, 32), enc.channels))
         check(f'encoder {name} strides 4/8/16/32', ok, str(shapes))
     a0 = T.parse_args(['--splits', 'x', '--out', 'y'])
-    check('defaults: DINOv3-SAT ViT-L semantic prior, gated fusion, error+fm mining',
+    check('defaults: DINOv3-SAT ViT-L prior, gated fusion, prior hallucination, error mining, auto precision',
           a0.fm == 'vit_large_patch16_dinov3.sat493m' and a0.fm_mode == 'fuse' and a0.fm_fusion == 'gated'
-          and a0.hard_mining == 'error+fm')
-    check("'--fm none' resolves mining to 'error'", T.parse_args(['--splits', 'x', '--out', 'y', '--fm', 'none'])
-          .hard_mining == 'error')
+          and a0.fm_sub == 'hal' and a0.fm_sub_p == 0.5 and a0.hal_weight == 0.5 and a0.hard_mining == 'error'
+          and a0.precision == 'auto')
+    an = T.parse_args(['--splits', 'x', '--out', 'y', '--fm', 'none'])
+    check("'--fm none': no substitution, no hallucination loss, 'error' mining",
+          an.fm_sub == 'none' and an.hal_weight == 0.0 and an.hard_mining == 'error')
+    check("'--no-amp' = '--precision fp32'; '--hard-mining auto' keeps the v1 meaning; distill has no substitution",
+          T.parse_args(['--splits', 'x', '--out', 'y', '--no-amp']).precision == 'fp32' and
+          T.parse_args(['--splits', 'x', '--out', 'y', '--hard-mining', 'auto']).hard_mining == 'error+fm' and
+          T.parse_args(['--splits', 'x', '--out', 'y', '--fm-mode', 'distill']).fm_sub == 'none')
     a = T.parse_args(['--splits', 'x', '--out', 'y', '--encoder', 'convnext_tiny', '--no-pretrained', '--fm', 'none'])
     model = T.build_model(a, pretrained=False)
     model.train()
@@ -244,6 +259,13 @@ def test_encoders_and_model(download):
                                                                                          'distill', 'ms_', 'tag'))}
     ml = T.build_model(argparse.Namespace(**legacy), pretrained=False)
     check('legacy checkpoint args build SP-UNet', ml.fm_name is None and T.arg(legacy, 'hard_mining') == 'error')
+    v1 = {k: v for k, v in vars(args('--img-size', '64', '--fm', TINY_FM, '--fm-sub', 'none')).items()
+          if k not in ('fm_sub', 'fm_sub_p', 'hal_weight', 'precision', 'select_prior', 'fp32_switch_frac')}
+    m1 = T.build_model(argparse.Namespace(**v1), pretrained=False)
+    check('v1 DPF-Net checkpoint args build the v1 network (no hallucination head)',
+          m1.fm_sub == 'none' and m1.hal is None and not m1.lite_capable and m1.needs_fm)
+    check('training precision of earlier runs', T.run_precision({'no_amp': True}) == 'fp32' and
+          T.run_precision({'no_amp': False}) == 'fp16' and T.run_precision({'precision': 'auto'}) == 'auto')
     if download:
         enc = T.Encoder('convnext_tiny.dinov3_lvd1689m', pretrained=True)
         check('DINOv3 ConvNeXt-T pretrained weights load', enc.channels == [96, 192, 384, 768], str(enc.channels))
@@ -256,19 +278,28 @@ def test_foundation_prior():
     check('gated injection is the identity at initialisation (zero-init BN)', torch.equal(inj(c, f, s), c))
     inj2 = T.SemanticInjection(32, 16, 0, gated=False).eval()
     check('additive injection is the identity at initialisation', torch.equal(inj2(c, f), c))
-    variants = {'fuse/gated': ['--fm', TINY_FM], 'fuse/add': ['--fm', TINY_FM, '--fm-fusion', 'add'],
+    variants = {'v1 fuse/gated': ['--fm', TINY_FM, '--fm-sub', 'none'],
+                'v1 fuse/add': ['--fm', TINY_FM, '--fm-sub', 'none', '--fm-fusion', 'add'],
+                'prior dropout': ['--fm', TINY_FM, '--fm-sub', 'zero'],
+                'prior hallucination': ['--fm', TINY_FM, '--fm-sub', 'hal'],
+                'hallucination + error+fm mining': ['--fm', TINY_FM, '--hard-mining', 'error+fm'],
                 'distill': ['--fm', TINY_FM, '--fm-mode', 'distill'],
                 'no structural prior': ['--fm', TINY_FM, '--no-hires', '--no-prior'],
                 'fm-size 48': ['--fm', TINY_FM, '--fm-size', '48']}
     for name, flags in variants.items():
         a = args('--img-size', '64', *flags)
         m = T.build_model(a, pretrained=False).train()
-        out = m(torch.rand(2, 3, 64, 64))
-        y = torch.zeros(2, 1, 64, 64)
+        out = m(torch.rand(4, 3, 64, 64))
+        y = torch.zeros(4, 1, 64, 64)
         y[:, :, 8:40, 8:40] = 1.0
         loss, parts = T.compute_loss(out, y, a)
         loss.backward()
-        want = {'seg', 'aux4', 'aux8', 'bnd', 'emb', 'fm_sem'} | ({'distill'} if 'distill' in name else set())
+        sub = a.fm_sub
+        want = ({'seg', 'aux4', 'aux8', 'bnd', 'emb', 'fm_sem'} | ({'distill'} if 'distill' in name else set())
+                | ({'fm_rows'} if sub != 'none' else set()) | ({'hal', 'hal_target'} if sub == 'hal' else set()))
+        if sub != 'none':
+            check(f'FM {name}: the real prior is used for half of the batch only',
+                  out['fm_rows'].numel() == 2 and out['fm_sem'].shape[0] == 2)
         check(f'FM {name}: outputs, finite loss, every parameter gets a gradient',
               set(out) == want and bool(torch.isfinite(loss)) and not grads_ok(m),
               f'parts {[round(v, 3) for v in parts.tolist()]}' + (f' unused {grads_ok(m)[:3]}' if grads_ok(m) else ''))
@@ -284,6 +315,48 @@ def test_foundation_prior():
     finally:
         T.get_foundation = orig
     check('DPF-Lite inference does not touch the foundation model', ok)
+    # prior substitution: 'lite' inference without the foundation model; at initialisation full == lite
+    for sub in ('zero', 'hal'):
+        a = args('--img-size', '64', '--fm', TINY_FM, '--fm-sub', sub)
+        m = T.build_model(a, pretrained=False).eval()
+        x = torch.rand(2, 3, 64, 64)
+        with torch.no_grad():
+            full = m(x, prior='full')['seg']
+        T.get_foundation = lambda *k, **kw: (_ for _ in ()).throw(RuntimeError('FM used at inference'))
+        try:
+            with torch.no_grad():
+                lite = m(x, prior='lite')['seg']
+            ok = True
+        except RuntimeError:
+            ok = False
+        finally:
+            T.get_foundation = orig
+        check(f'--fm-sub {sub}: lite inference without the foundation model; identical to full at init (zero-init)',
+              ok and torch.equal(full, lite) and m.lite_capable
+              and T.inference_variants(m) == [('', 'full'), ('-lite', 'lite')])
+    m = T.build_model(args('--img-size', '64', '--fm', TINY_FM, '--fm-sub', 'none'), pretrained=False).eval()
+    try:
+        m(torch.rand(1, 3, 64, 64), prior='lite')
+        refused = False
+    except ValueError:
+        refused = True
+    check('a v1 (no substitution) model refuses lite inference', refused and T.inference_variants(m) == [('', None)])
+    t = torch.randn(2, 8, 4, 4)
+    check('hallucination loss: 0 for a perfect prediction, 1 for a zero prediction',
+          float(T.hallucination_loss(t, t)) == 0.0
+          and abs(float(T.hallucination_loss(torch.zeros_like(t), t)) - 1) < 1e-5)
+    f = torch.nn.functional.normalize(torch.randn(2, 8, 4, 4), dim=1)
+    mask = torch.zeros(3, 1, 16, 16)
+    mask[:, :, :8, :8] = 1.0
+    s = T.semantic_score({'fm_sem': f, 'fm_rows': torch.tensor([0, 2])}, mask)
+    check('semantic score: NaN exactly for the substituted samples',
+          tuple(s.shape) == (3, 1, 4, 4) and bool(torch.isnan(s[1]).all()) and bool(torch.isfinite(s[[0, 2]]).all()))
+    emb = torch.randn(3, 16, 8, 8, requires_grad=True)
+    l = T.pixel_contrast_loss(emb, torch.randn(3, 1, 16, 16), mask, n_per_class=16, pos_thr=0.5, neg_thr=0.5,
+                              mining='error+fm', sem_score=s)
+    l.backward()
+    check('semantic mining ignores samples without foundation features', bool(torch.isfinite(l)) and
+          float(emb.grad.abs().sum()) > 0)
     # the frozen ViT is shared, excluded from state_dict / EMA / optimizer
     a = args('--img-size', '64', '--fm', TINY_FM)
     m = T.build_model(a, pretrained=False)
@@ -302,8 +375,12 @@ def test_foundation_prior():
                                                     T.get_foundation(TINY_FM, False).parameters()))
           and len(f1) == 4 and tuple(f1[0].shape) == (1, 192, 4, 4) and m2.fm_idx == [2, 5, 8, 11])
     st = T.param_report(m)
-    check('parameter report separates frozen FM parameters', st['fm_frozen_params_M'] > 5.0 and
-          abs(st['inference_params_M'] - (st['params_M'] - st['train_only_heads_M'] + st['fm_frozen_params_M'])) < 1e-9)
+    hal = sum(p.numel() for p in m.hal.parameters()) / 1e6
+    adapter = sum(p.numel() for p in m.fm_adapter.parameters()) / 1e6
+    check('parameter report: frozen FM counted for full inference, hallucination head only for lite',
+          st['fm_frozen_params_M'] > 5.0 and abs(st['inference_params_M'] - (
+              st['params_M'] - st['train_only_heads_M'] - hal + st['fm_frozen_params_M'])) < 1e-9
+          and abs(st['inference_params_lite_M'] - (st['params_M'] - st['train_only_heads_M'] - adapter)) < 1e-9)
 
 
 def test_evaluate_counts():
@@ -337,7 +414,7 @@ def test_evaluate_counts():
 
 def test_results_and_bootstrap(tmp):
     m = T.metrics_from_counts(80, 10, 10, 900)
-    res = {'run': 'x', 'tag': 'A6', 'args': vars(args('--fm', TINY_FM, '--ms-tta')), 'n_test': 5, 'n_val': 2,
+    res = {'run': 'x', 'tag': 'B6', 'args': vars(args('--fm', TINY_FM, '--ms-tta')), 'n_test': 5, 'n_val': 2,
            'weights': 'w', 'threshold': 0.45, 'threshold_source': 'best validation IoU with TTA', 'tta': True,
            'tta_mode': 'MSTTA', 'main_key': 'test_MSTTA@t*', 'thresholds': {'TTA': 0.5, 'MSTTA': 0.45},
            'test_noTTA@0.5': m, 'test_TTA@0.5': m, 'test_TTA@t*': m, 'test_MSTTA@0.5': m, 'test_MSTTA@t*': m,
@@ -345,6 +422,15 @@ def test_results_and_bootstrap(tmp):
     md = T.results_markdown(res, 'SAT')
     check('results.md marks the validation-selected MS-TTA row as main',
           'D4+MS-TTA, t=t* (main)' in md and 'D4-TTA, t=t* (main)' not in md and 'semantic prior' in md)
+    lite = {**res, 'args': vars(args('--fm', TINY_FM)), 'tta_mode': 'TTA', 'main_key': 'test_TTA@t*',
+            'lite_key': 'test_TTA-lite@t*', 'tta_mode_lite': 'TTA-lite', 'test_noTTA-lite@0.5': m,
+            'test_TTA-lite@0.5': m, 'test_TTA-lite@t*': m, 'val_TTA-lite@0.5': m, 'val_TTA-lite@t*': m,
+            'thresholds': {'TTA': 0.5, 'TTA-lite': 0.45},
+            'per_region_by_mode': {'TTA-lite': {'R1': {**m, 'tiles': 3}}}}
+    md = T.results_markdown(lite, 'SAT')
+    check('results.md lists the evaluation without the foundation model',
+          'D4-TTA, t=t*, no FM at inference (main, no FM)' in md and 'D4-TTA, no FM at inference)' in md
+          and 'prior hallucination' in md and 'training precision: auto' in md and 'without the foundation model' in md)
     old = {'run': 'old', 'args': vars(args('--fm', 'none')), 'n_test': 5, 'n_val': 2, 'weights': 'w',
            'threshold': 0.5, 'threshold_source': 's', 'tta': True, 'main_key': 'test_TTA@t*', 'test_TTA@t*': m,
            'val_at_0.5': m, 'val_at_t*': m}
@@ -369,8 +455,13 @@ def test_results_and_bootstrap(tmp):
                                                              {A.FM_SAT: 'tiny'}) == ['--fm', 'tiny', '--fm-mode', 'fuse',
                                                                                       '--fm', 'none'])
     ids = list(A.EXPERIMENTS)
-    check('registry: unique ids, every pair references known ids',
-          len(ids) == len(set(ids)) and all(x in A.EXPERIMENTS and y in A.EXPERIMENTS for x, y in A.PAIRS))
+
+    def known(e):
+        return e.split(':')[0] in A.EXPERIMENTS
+
+    check('registry: unique ids, every pair / chain / seed entry references known ids',
+          len(ids) == len(set(ids)) and all(known(x) and known(y) for x, y in A.PAIRS)
+          and all(known(t) for c in A.CHAIN.values() for t in c) and all(known(t) for t in A.SEEDS))
     bad = []
     for eid, e in A.EXPERIMENTS.items():
         try:
@@ -378,23 +469,43 @@ def test_results_and_bootstrap(tmp):
         except SystemExit:
             bad.append(eid)
     check('every registry entry parses', not bad, str(bad))
-    t = T.parse_args(['--splits', 'x', '--out', 'y'] + A.EXPERIMENTS['A3']['args'])
-    check('A3 = SP-UNet configuration', t.fm == 'none' and t.hard_mining == 'error' and not t.no_prior
-          and t.boundary_weight > 0 and t.contrast_weight > 0)
+    def P(eid):
+        return T.parse_args(['--splits', 'x', '--out', 'y'] + A.EXPERIMENTS[eid]['args'])
+
+    t = P('B3')
+    check('B3 = SP-UNet configuration', t.fm == 'none' and t.hard_mining == 'error' and not t.no_prior
+          and t.boundary_weight > 0 and t.contrast_weight > 0 and t.precision == 'auto')
+    t4, t5, t6, t7 = P('B4'), P('B5'), P('B6'), P('B7')
+    check('B4 / B5 / B6 / B7 differ only in prior substitution and mining',
+          (t4.fm_sub, t5.fm_sub, t6.fm_sub, t7.fm_sub) == ('none', 'zero', 'hal', 'hal')
+          and (t4.hard_mining, t6.hard_mining, t7.hard_mining) == ('error', 'error', 'error+fm')
+          and t6.fm == A.FM_SAT and t6.fm_fusion == 'gated' and t6.hal_weight == 0.5)
+    prec = {eid: P(eid).precision for eid in ids}
+    check('every row trains with --precision auto except the precision controls',
+          all(v == 'auto' for k, v in prec.items() if k not in ('P0', 'R3', 'W3'))
+          and (prec['P0'], prec['R3'], prec['W3']) == ('fp16', 'fp32', 'fp32'))
+    runs = {'B6': {'res': {'ablation_key': 'test_TTA@t*', 'main_key': 'test_TTA@t*',
+                           'lite_ablation_key': 'test_TTA-lite@t*', 'lite_key': 'test_TTA-lite@t*',
+                           'test_TTA@t*': m, 'test_TTA-lite@t*': m}},
+            'B3': {'res': {'ablation_key': 'test_TTA@t*', 'test_TTA@t*': m}}}
+    ent = A.entries_of(runs)
+    check('collector rows: run + "<id>:lite" for runs evaluated without the FM',
+          list(ent) == ['B3', 'B6', 'B6:lite'] and A.key_mode(ent['B6:lite']['key']) == 'TTA-lite'
+          and ent['B6:lite']['lite'] and not ent['B6']['lite'])
     # the exact command lines the Kaggle notebook builds (RUN / ENV / COLLECT cells)
     p = A.build_parser()
-    r = p.parse_args(['run', '--work', '/kaggle/working', '--queue', 'A6', 'A0', '--epochs', '80', '--batch-size', '8',
+    r = p.parse_args(['run', '--work', '/kaggle/working', '--queue', 'B3', 'B6', '--epochs', '80', '--batch-size', '8',
                       '--session-hours', '11.5', '--t0', '1795000000.5', '--extra=', '--prev', '/kaggle/input',
-                      '--import', 'A3=/kaggle/input/x/runs/r/best.pth', 'U3=/kaggle/input/y/best.pth', '--quick'])
-    check('notebook RUN command parses', r.queue == ['A6', 'A0'] and r.prev == ['/kaggle/input'] and r.extra == ''
-          and A.parse_map(r.imports, 'i') == {'A3': '/kaggle/input/x/runs/r/best.pth', 'U3': '/kaggle/input/y/best.pth'}
+                      '--import', 'R3=/kaggle/input/x/runs/r/best.pth', 'W3=/kaggle/input/y/best.pth', '--quick'])
+    check('notebook RUN command parses', r.queue == ['B3', 'B6'] and r.prev == ['/kaggle/input'] and r.extra == ''
+          and A.parse_map(r.imports, 'i') == {'R3': '/kaggle/input/x/runs/r/best.pth', 'W3': '/kaggle/input/y/best.pth'}
           and r.quick and r.t0 == 1795000000.5)
-    r = p.parse_args(['run', '--work', 'w', '--queue', 'A6', '--extra=--grad-ckpt --fm-size 384', '--prev'])
+    r = p.parse_args(['run', '--work', 'w', '--queue', 'B6', '--extra=--grad-ckpt --fm-size 384', '--prev'])
     check('extra arguments and an empty --prev parse', A.split_args(r.extra) == ['--grad-ckpt', '--fm-size', '384']
           and r.prev == [])
-    w = p.parse_args(['weights', '--queue', 'A6', 'U6', '--extra='])
+    w = p.parse_args(['weights', '--queue', 'B6', 'V6', '--extra='])
     c = p.parse_args(['collect', '--roots', '/kaggle/working/runs', '/kaggle/input', '--out', '/kaggle/working/ablation'])
-    check('notebook ENV and COLLECT commands parse', w.queue == ['A6', 'U6'] and len(c.roots) == 2)
+    check('notebook ENV and COLLECT commands parse', w.queue == ['B6', 'V6'] and len(c.roots) == 2)
 
 
 def main():

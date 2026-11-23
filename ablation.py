@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """
-ablation.py - experiment registry, Kaggle session queue and results collector for DPF-Net.
+ablation.py - experiment registry, Kaggle session queue and results collector for DPF-Net (v2).
 
   python ablation.py list
-  python ablation.py weights --queue A6 U6          # pre-download the encoder + foundation models of a queue
-  python ablation.py run --work /kaggle/working --queue A6 A0 A5 [--prev /kaggle/input] [--session-hours 11.5]
+  python ablation.py weights --queue B6 V6          # pre-download the encoder + foundation models of a queue
+  python ablation.py run --work /kaggle/working --queue B3 B6 B4 [--prev /kaggle/input] [--session-hours 11.5]
   python ablation.py collect --roots /kaggle/working/runs /kaggle/input --out /kaggle/working/ablation
+
+Registry v2 (B* = SAT, V* = UAV): every row is trained with the same precision ('--precision auto' = FP16 with an
+FP32 recompute of any step whose FP16 forward overflows), so rows differ only in the component under test. The
+v1 rows (A*, U*: mixed FP16 / imported FP32 runs) are no longer queued; their results are listed as earlier runs.
 
 run      Runs the queued experiments one after another (torchrun on all GPUs). Runs found below --prev (outputs of
          earlier notebook versions attached as inputs) are carried forward into <work>/runs; an unfinished run is
@@ -40,11 +44,15 @@ SKIP_DIRS = {'img', 'imgs', 'image', 'images', 'mask', 'masks', 'label', 'labels
              '.git', 'splits'}
 
 # ----------------------------------------------------------------------------------------
-# experiment registry  (every row: ConvNeXt-T DINOv3 encoder, same schedule, seed 42, same evaluation)
+# experiment registry v2 (every row: ConvNeXt-T DINOv3 encoder, 80 epochs, seed 42, '--precision auto', same
+# evaluation; rows with prior substitution are also evaluated without the foundation model -> row '<id>:lite')
 # ----------------------------------------------------------------------------------------
 EXPERIMENTS = OrderedDict()
 BASE = ['--no-hires', '--no-prior', '--boundary-weight', '0', '--contrast-weight', '0']
-FULL = ['--fm', FM_SAT, '--fm-mode', 'fuse', '--fm-fusion', 'gated', '--hard-mining', 'error+fm']
+
+
+def fuse(fm=FM_SAT, sub='hal', mining='error', fusion='gated'):
+    return ['--fm', fm, '--fm-mode', 'fuse', '--fm-fusion', fusion, '--fm-sub', sub, '--hard-mining', mining]
 
 
 def _exp(eid, subset, title, args, group, priority):
@@ -52,36 +60,42 @@ def _exp(eid, subset, title, args, group, priority):
                         'priority': priority}
 
 
-_exp('A0', 'SAT', 'UNet + PPM baseline', ['--fm', 'none'] + BASE, 'component', 1)
-_exp('A1', 'SAT', '+ spectral-structural prior & high-res stem',
+_exp('B0', 'SAT', 'UNet + PPM baseline', ['--fm', 'none'] + BASE, 'component', 1)
+_exp('B1', 'SAT', '+ spectral-structural prior & high-res stem',
      ['--fm', 'none', '--boundary-weight', '0', '--contrast-weight', '0'], 'component', 2)
-_exp('A2', 'SAT', '+ boundary head', ['--fm', 'none', '--contrast-weight', '0'], 'component', 2)
-_exp('A3', 'SAT', '+ error-mined pixel contrast (= SP-UNet)', ['--fm', 'none'], 'component', 1)
-_exp('A4', 'SAT', '+ foundation semantic prior, additive fusion',
-     ['--fm', FM_SAT, '--fm-mode', 'fuse', '--fm-fusion', 'add', '--hard-mining', 'error'], 'component', 2)
-_exp('A5', 'SAT', '+ structure-aware gated fusion',
-     ['--fm', FM_SAT, '--fm-mode', 'fuse', '--fm-fusion', 'gated', '--hard-mining', 'error'], 'component', 1)
-_exp('A6', 'SAT', '+ semantic hard-negative mining = DPF-Net', FULL + ['--ms-tta'], 'component', 1)
-_exp('A7', 'SAT', 'DPF-Net without structural prior / high-res stem',
-     FULL + ['--no-hires', '--no-prior'], 'complementarity', 1)
-_exp('A8', 'SAT', 'DPF-Lite: foundation model only during training',
-     ['--fm', FM_SAT, '--fm-mode', 'distill', '--hard-mining', 'error+fm', '--ms-tta'], 'efficiency', 2)
-_exp('A9', 'SAT', 'DPF-Net with a web-image foundation model',
-     ['--fm', FM_WEB, '--fm-mode', 'fuse', '--fm-fusion', 'gated', '--hard-mining', 'error+fm'], 'pretraining', 2)
-_exp('S1', 'SAT', 'DPF-Net, seed 1', FULL + ['--ms-tta', '--seed', '1'], 'seeds', 3)
-_exp('S2', 'SAT', 'DPF-Net, seed 2', FULL + ['--ms-tta', '--seed', '2'], 'seeds', 3)
-_exp('U0', 'UAV', 'UAV: UNet + PPM baseline', ['--fm', 'none'] + BASE, 'uav', 2)
-_exp('U3', 'UAV', 'UAV: SP-UNet', ['--fm', 'none'], 'uav', 1)
-_exp('U6', 'UAV', 'UAV: DPF-Net', FULL + ['--ms-tta'], 'uav', 1)
-_exp('U8', 'UAV', 'UAV: DPF-Lite', ['--fm', FM_SAT, '--fm-mode', 'distill', '--hard-mining', 'error+fm', '--ms-tta'],
-     'uav', 3)
+_exp('B2', 'SAT', '+ boundary head', ['--fm', 'none', '--contrast-weight', '0'], 'component', 2)
+_exp('B3', 'SAT', '+ error-mined pixel contrast (= SP-UNet)', ['--fm', 'none'], 'component', 1)
+_exp('B4', 'SAT', '+ frozen-FM prior, gated fusion (v1 DPF-Net)', fuse(sub='none'), 'component', 1)
+_exp('B5', 'SAT', '+ prior dropout (p = 0.5)', fuse(sub='zero'), 'component', 2)
+_exp('B6', 'SAT', '+ prior hallucination = DPF-Net v2 (ours)', fuse(sub='hal'), 'component', 1)
+_exp('B7', 'SAT', 'DPF-Net v2 + semantic hard-negative mining', fuse(sub='hal', mining='error+fm'), 'mining', 2)
+_exp('B8', 'SAT', 'FM feature distillation only (FM-free baseline)',
+     ['--fm', FM_SAT, '--fm-mode', 'distill', '--hard-mining', 'error'], 'efficiency', 2)
+_exp('B9', 'SAT', 'DPF-Net v2 with a web-image FM', fuse(fm=FM_WEB), 'pretraining', 3)
+_exp('C6', 'SAT', 'DPF-Net v2 without the structural prior / stem', fuse() + ['--no-hires', '--no-prior'],
+     'complementarity', 2)
+_exp('G6', 'SAT', 'DPF-Net v2 with additive instead of gated fusion', fuse(fusion='add'), 'fusion', 3)
+_exp('P0', 'SAT', 'SP-UNet, plain FP16 (precision control)', ['--fm', 'none', '--precision', 'fp16'], 'precision', 3)
+_exp('R3', 'SAT', 'SP-UNet, full FP32 (reference)', ['--fm', 'none', '--precision', 'fp32'], 'precision', 3)
+_exp('S1', 'SAT', 'DPF-Net v2, seed 1', fuse() + ['--seed', '1'], 'seeds', 3)
+_exp('S2', 'SAT', 'DPF-Net v2, seed 2', fuse() + ['--seed', '2'], 'seeds', 3)
+_exp('V0', 'UAV', 'UAV: UNet + PPM baseline', ['--fm', 'none'] + BASE, 'uav', 2)
+_exp('V3', 'UAV', 'UAV: SP-UNet', ['--fm', 'none'], 'uav', 1)
+_exp('V4', 'UAV', 'UAV: v1 DPF-Net (frozen-FM fusion)', fuse(sub='none'), 'uav', 3)
+_exp('V6', 'UAV', 'UAV: DPF-Net v2 (ours)', fuse(sub='hal'), 'uav', 1)
+_exp('W3', 'UAV', 'UAV: SP-UNet, full FP32 (reference)', ['--fm', 'none', '--precision', 'fp32'], 'precision', 3)
 
-# comparisons tested with the paired bootstrap (reference, candidate): candidate - reference
-PAIRS = [('A0', 'A1'), ('A1', 'A2'), ('A2', 'A3'), ('A3', 'A4'), ('A4', 'A5'), ('A5', 'A6'), ('A3', 'A5'),
-         ('A3', 'A6'), ('A0', 'A6'), ('A7', 'A6'), ('A8', 'A6'), ('A3', 'A8'), ('A9', 'A6'),
-         ('U0', 'U3'), ('U3', 'U6'), ('U0', 'U6'), ('U8', 'U6'), ('U3', 'U8')]
-CHAIN = {'SAT': ['A0', 'A1', 'A2', 'A3', 'A4', 'A5', 'A6', 'A7', 'A8', 'A9'], 'UAV': ['U0', 'U3', 'U6', 'U8']}
-LEGACY = {'fm': 'none', 'fm_mode': 'fuse', 'fm_fusion': 'gated', 'hard_mining': 'error'}
+# comparisons tested with the paired bootstrap (reference, candidate): candidate - reference; 'X:lite' = run X
+# evaluated without the foundation model
+PAIRS = [('B0', 'B1'), ('B1', 'B2'), ('B2', 'B3'), ('B3', 'B4'), ('B4', 'B5'), ('B4', 'B6'), ('B5', 'B6'),
+         ('B3', 'B6'), ('B3', 'B6:lite'), ('B6:lite', 'B6'), ('B8', 'B6:lite'), ('B3', 'B8'), ('B6', 'B7'),
+         ('B9', 'B6'), ('C6', 'B6'), ('G6', 'B6'), ('B0', 'B6'), ('P0', 'B3'), ('R3', 'B3'),
+         ('V0', 'V3'), ('V3', 'V6'), ('V3', 'V6:lite'), ('V4', 'V6'), ('V0', 'V6'), ('W3', 'V3')]
+CHAIN = {'SAT': ['B0', 'B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B6:lite', 'B7', 'B8', 'B9', 'C6', 'G6'],
+         'UAV': ['V0', 'V3', 'V4', 'V6', 'V6:lite']}
+BASELINE = {'SAT': 'B0', 'UAV': 'V0'}
+SEEDS = ['B6', 'S1', 'S2']
+LEGACY = {'fm': 'none', 'fm_mode': 'fuse', 'fm_fusion': 'gated', 'hard_mining': 'error', 'fm_sub': 'none'}
 
 
 def fm_enabled(name):
@@ -289,12 +303,15 @@ def launcher(nproc):
 
 
 def eval_reserve_hours(ta, subset, nproc):
-    """Conservative estimate of the final evaluation time (T4, FP16): validation sweep + test, all TTA passes."""
+    """Conservative estimate of the final evaluation time (T4, FP16): validation sweep + test, all TTA passes;
+    models with prior substitution are evaluated twice (with and without the foundation model)."""
     passes = 1 if ta.no_tta else (12 if ta.ms_tta else 8)
-    fuse = fm_enabled(ta.fm) and ta.fm_mode == 'fuse'
-    ips = (9.0 if fuse else 16.0) * max(1, nproc)  # single-pass images / s
+    fused = fm_enabled(ta.fm) and ta.fm_mode == 'fuse'
     n = VAL_TILES.get(subset, 1000) + TEST_TILES.get(subset, 3000)
-    return n * passes / ips / 3600 * 1.15 + 0.12
+    sec = n * passes / ((9.0 if fused else 16.0) * max(1, nproc))  # single-pass images / s
+    if fused and getattr(ta, 'fm_sub', 'none') != 'none':
+        sec += n * passes / (16.0 * max(1, nproc))  # 'lite' evaluation, no foundation model
+    return sec / 3600 * 1.15 + 0.12
 
 
 def ensure_splits(work, subset, prep_args):
@@ -426,7 +443,16 @@ def abl_key(res):
     return res.get('ablation_key') or ('test_TTA@t*' if res.get('tta') else 'test_noTTA@t*')
 
 
-def components(r):
+SUB_SHORT = {'none': '', 'zero': ' + prior dropout', 'hal': ' + hallucination'}
+
+
+def precision_of(g):
+    if g.get('precision'):
+        return g['precision']
+    return 'fp32' if g.get('no_amp') else 'fp16'
+
+
+def components(r, lite=False):
     g = margs(r)
     struct = 'yes' if not g.get('no_prior') else ('stem only' if not g.get('no_hires') else 'no')
     bnd = 'yes' if g.get('boundary_weight', 0) > 0 else 'no'
@@ -437,12 +463,37 @@ def components(r):
     elif garg(g, 'fm_mode') == 'distill':
         sem = f'{short_fm(fm)}, training only'
     else:
-        sem = f'{short_fm(fm)}, {garg(g, "fm_fusion")}'
-    return {'struct': struct, 'boundary': bnd, 'contrast': con, 'semantic': sem}
+        sem = f'{short_fm(fm)}, {garg(g, "fm_fusion")}{SUB_SHORT.get(garg(g, "fm_sub") or "none", "")}'
+        if lite:
+            sem += ' (FM not used at inference)'
+    return {'struct': struct, 'boundary': bnd, 'contrast': con, 'semantic': sem, 'precision': precision_of(g)}
 
 
-def title_of(tag, r):
-    return EXPERIMENTS[tag]['title'] if tag in EXPERIMENTS else r['res'].get('run', tag)
+def title_of(tag, r, lite=False):
+    if tag in EXPERIMENTS:
+        t = EXPERIMENTS[tag]['title']
+    else:  # earlier runs (e.g. the v1 'A6' found in an attached output)
+        t = f'earlier run {r["res"].get("run", tag)}'
+    return t + (' - without the FM at inference' if lite else '')
+
+
+def entries_of(runs):
+    """Table rows: every run, plus '<id>:lite' for runs also evaluated without the foundation model."""
+    order = [t for t in EXPERIMENTS if t in runs] + sorted(t for t in runs if t not in EXPERIMENTS)
+    ent = OrderedDict()
+    for tag in order:
+        r = runs[tag]
+        res = r['res']
+        ent[tag] = {'tag': tag, 'run': r, 'key': abl_key(res), 'main_key': res.get('main_key'), 'lite': False}
+        lk = res.get('lite_ablation_key')
+        if lk and res.get(lk):
+            ent[tag + ':lite'] = {'tag': tag, 'run': r, 'key': lk, 'main_key': res.get('lite_key') or lk, 'lite': True}
+    return ent
+
+
+def key_mode(key):
+    """'test_TTA-lite@t*' -> 'TTA-lite'."""
+    return key.split('_', 1)[1].split('@')[0]
 
 
 def read_tiles(r, mode):
@@ -521,37 +572,39 @@ def cmd_collect(a):
     if not runs:
         print('collect: no results.json found below', a.roots)
         return
-    order = [t for t in EXPERIMENTS if t in runs] + sorted(t for t in runs if t not in EXPERIMENTS)
+    ent = entries_of(runs)
     summary = {'runs': {}, 'pairs': [], 'seeds': {}}
 
-    # ---- per-run rows -------------------------------------------------------------------------------
+    # ---- per-entry rows (a run, or a run evaluated without the foundation model: '<id>:lite') -------------------
     rows = []
-    for tag in order:
-        r = runs[tag]
-        res = r['res']
+    for eid, e in ent.items():
+        r, res = e['run'], e['run']['res']
         g = margs(r)
-        m = res[abl_key(res)]
-        main = res.get('main') or m
-        st = res.get('model_stats') or {}
-        subset = (res.get('subset') or EXPERIMENTS.get(tag, {}).get('subset') or 'SAT')
-        base_tag = 'A0' if subset == 'SAT' else 'U0'
-        base = runs.get(base_tag)
-        d0 = (m['iou'] - base['res'][abl_key(base['res'])]['iou']) if base and base_tag != tag else None
-        comp = components(r)
+        m = res[e['key']]
+        main = res.get(e['main_key']) or m
+        st = (res.get('model_stats_lite') if e['lite'] else res.get('model_stats')) or {}
+        subset = (res.get('subset') or EXPERIMENTS.get(e['tag'], {}).get('subset') or 'SAT')
+        base = ent.get(BASELINE.get(subset, ''))
+        d0 = (m['iou'] - base['run']['res'][base['key']]['iou']) if base and base is not e else None
+        comp = components(r, e['lite'])
+        hist = r.get('hist') or []
         row = OrderedDict([
-            ('id', tag), ('subset', subset), ('configuration', title_of(tag, r)),
+            ('id', eid), ('subset', subset), ('configuration', title_of(e['tag'], r, e['lite'])),
             ('struct_prior', comp['struct']), ('boundary', comp['boundary']), ('contrast_mining', comp['contrast']),
-            ('semantic_prior', comp['semantic']), ('epochs', res.get('epochs_done') or g.get('epochs')),
-            ('complete', res.get('schedule_complete')), ('eval_setting', abl_key(res).replace('test_', '')),
+            ('semantic_prior', comp['semantic']), ('precision', comp['precision']),
+            ('epochs', res.get('epochs_done') or g.get('epochs')),
+            ('complete', res.get('schedule_complete')), ('eval_setting', key_mode(e['key'])),
             ('P', m['precision']), ('R', m['recall']), ('F1', m['f1']), ('IoU', m['iou']), ('mIoU', m['miou']),
-            ('dIoU_vs_baseline', d0), ('main_setting', res.get('main_key', '').replace('test_', '')),
+            ('dIoU_vs_baseline', d0), ('main_setting', key_mode(e['main_key']) if e['main_key'] else ''),
             ('main_IoU', main['iou']), ('main_F1', main['f1']),
-            ('params_M', st.get('params_M')), ('inference_params_M', st.get('inference_params_M')),
+            ('params_M', st.get('params_M')),
+            ('inference_params_M', st.get('inference_params_lite_M' if e['lite'] else 'inference_params_M')),
             ('gflops', st.get('gflops')), ('fps', st.get('fps_batch8')),
-            ('train_hours', res.get('train_hours_total', res.get('train_hours')))])
+            ('train_hours', res.get('train_hours_total', res.get('train_hours'))),
+            ('fp32_recomputes', sum(int(h.get('fp32_recomputes') or 0) for h in hist) if hist else None)])
         rows.append(row)
-        summary['runs'][tag] = {k: v for k, v in row.items()}
-        summary['runs'][tag]['dir'] = str(r['dir'])
+        summary['runs'][eid] = {k: v for k, v in row.items()}
+        summary['runs'][eid]['dir'] = str(r['dir'])
 
     with open(out / 'ablation_table.csv', 'w', newline='', encoding='utf-8') as f:
         w = csv.writer(f)
@@ -566,23 +619,26 @@ def cmd_collect(a):
           'IoU / F1 / P / R in % for the landslide class from dataset-level pixel counts. "Eval" is the setting '
           'compared across rows (validation-selected threshold, D4-TTA unless stated); "Main" is the '
           'validation-selected main setting of each run (may add multi-scale TTA). dIoU = IoU - baseline IoU '
-          '(A0 for SAT, U0 for UAV), percentage points.', '']
+          '(B0 for SAT, V0 for UAV), percentage points. Rows "<id>:lite" are the same trained network evaluated '
+          'WITHOUT the foundation model (hallucinated prior / no prior). "Prec." = training precision (auto = '
+          'FP16 with FP32 recompute of overflowing steps).', '']
     for subset in ('SAT', 'UAV'):
         sub = [r for r in rows if r['subset'] == subset]
         if not sub:
             continue
         md += [f'## {subset}', '',
-               '| ID | Configuration | Struct. prior | Boundary | Contrast mining | Semantic prior | Ep. | P | R | F1 | '
-               'IoU | dIoU | Main IoU | Train. params (M) | Infer. params (M) | GFLOPs | FPS | Train h |',
-               '|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|']
+               '| ID | Configuration | Struct. prior | Boundary | Contrast mining | Semantic prior | Prec. | Ep. | P | R | '
+               'F1 | IoU | dIoU | Main IoU | Train. params (M) | Infer. params (M) | GFLOPs | FPS | Train h |',
+               '|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|']
         for r in sub:
             d = '-' if r['dIoU_vs_baseline'] is None else f'{100 * r["dIoU_vs_baseline"]:+.2f}'
             inc = '' if r['complete'] is not False else ' (incomplete)'
             md.append(f'| {r["id"]} | {r["configuration"]}{inc} | {r["struct_prior"]} | {r["boundary"]} | '
-                      f'{r["contrast_mining"]} | {r["semantic_prior"]} | {r["epochs"]} | {pct(r["P"])} | {pct(r["R"])} | '
-                      f'{pct(r["F1"])} | **{pct(r["IoU"])}** | {d} | {pct(r["main_IoU"])} ({r["main_setting"]}) | '
-                      f'{num(r["params_M"], 2)} | {num(r["inference_params_M"], 1)} | {num(r["gflops"])} | '
-                      f'{num(r["fps"])} | {num(r["train_hours"], 2)} |')
+                      f'{r["contrast_mining"]} | {r["semantic_prior"]} | {r["precision"]} | {r["epochs"]} | '
+                      f'{pct(r["P"])} | {pct(r["R"])} | {pct(r["F1"])} | **{pct(r["IoU"])}** | {d} | '
+                      f'{pct(r["main_IoU"])} ({r["main_setting"]}) | {num(r["params_M"], 2)} | '
+                      f'{num(r["inference_params_M"], 1)} | {num(r["gflops"])} | {num(r["fps"])} | '
+                      f'{num(r["train_hours"], 2)} |')
         md.append('')
 
     # ---- LaTeX (booktabs) ---------------------------------------------------------------------------
@@ -600,17 +656,14 @@ def cmd_collect(a):
     (out / 'ablation_table.tex').write_text('\n'.join(tex) + '\n', encoding='utf-8')
 
     # ---- paired bootstrap ---------------------------------------------------------------------------
-    tiles = {}
-    for tag in order:
-        mode = abl_key(runs[tag]['res']).split('_', 1)[1].split('@')[0]
-        tiles[tag] = read_tiles(runs[tag], mode)
+    tiles = {eid: read_tiles(e['run'], key_mode(e['key'])) for eid, e in ent.items()}
     ci = {}
-    for tag in order:
-        if tiles[tag]:
-            names = sorted(tiles[tag])
-            A = np.array([tiles[tag][n] for n in names])
-            ci[tag] = bootstrap(A, n_boot=a.n_boot, seed=1)['ci']
-            summary['runs'][tag]['IoU_ci95'] = ci[tag]
+    for eid in ent:
+        if tiles[eid]:
+            names = sorted(tiles[eid])
+            A = np.array([tiles[eid][n] for n in names])
+            ci[eid] = bootstrap(A, n_boot=a.n_boot, seed=1)['ci']
+            summary['runs'][eid]['IoU_ci95'] = ci[eid]
     sig = ['## Paired bootstrap tests (resampling test tiles; dIoU = candidate - reference)', '',
            f'{a.n_boot} bootstrap samples of the test tiles; 95% percentile interval; two-sided bootstrap p-value and '
            'its Holm adjustment over all comparisons listed. Both runs evaluated in the "Eval" setting of the '
@@ -637,26 +690,29 @@ def cmd_collect(a):
     md += sig + ['']
 
     # ---- seeds ------------------------------------------------------------------------------------
-    seed_tags = [t for t in ('A6', 'S1', 'S2') if t in runs]
-    if len(seed_tags) >= 2:
+    for sfx in ('', ':lite'):
+        seed_tags = [t + sfx for t in SEEDS if t + sfx in summary['runs']]
+        if len(seed_tags) < 2:
+            continue
         for key, label in (('IoU', 'Eval'), ('main_IoU', 'Main')):
             vals = [summary['runs'][t][key] for t in seed_tags]
             mu = sum(vals) / len(vals)
             sd = math.sqrt(sum((v - mu) ** 2 for v in vals) / (len(vals) - 1))
-            summary['seeds'][key] = {'runs': seed_tags, 'mean': mu, 'std': sd}
+            summary['seeds'][key + sfx] = {'runs': seed_tags, 'mean': mu, 'std': sd}
             md.append(f'Seeds ({", ".join(seed_tags)}), {label} IoU: {100 * mu:.2f} +- {100 * sd:.2f} (mean +- s.d.)')
         md.append('')
 
     # ---- per-region ---------------------------------------------------------------------------------
     for subset in ('SAT', 'UAV'):
-        tags = [t for t in order if summary['runs'][t]['subset'] == subset]
+        tags = [eid for eid in ent if summary['runs'][eid]['subset'] == subset]
         if not tags:
             continue
         per = {}
         for t in tags:
-            res = runs[t]['res']
-            mode = abl_key(res).split('_', 1)[1].split('@')[0]
-            per[t] = (res.get('per_region_by_mode') or {}).get(mode) or res.get('per_region') or {}
+            res = ent[t]['run']['res']
+            mode = key_mode(ent[t]['key'])
+            per[t] = (res.get('per_region_by_mode') or {}).get(mode) or ({} if ent[t]['lite'] else
+                                                                        res.get('per_region') or {})
         regions = sorted({rg for t in tags for rg in per[t]})
         if not regions:
             continue
@@ -716,11 +772,11 @@ def make_figures(runs, summary, ci, out):
     import matplotlib.pyplot as plt
     plt.rcParams.update({'font.family': 'sans-serif', 'font.size': 8, 'axes.labelcolor': INK2,
                          'text.color': INK, 'axes.titlesize': 9})
-    for subset, keys in (('SAT', ['A6', 'A3', 'A0', 'A8']), ('UAV', ['U6', 'U3', 'U0', 'U8'])):
+    for subset, keys in (('SAT', ['B6', 'B4', 'B3', 'B0']), ('UAV', ['V6', 'V4', 'V3', 'V0'])):
         series = [k for k in keys if k in runs]
         names = {k: (EXPERIMENTS[k]['title'].split('= ')[-1] if k in EXPERIMENTS else k) for k in series}
-        names.update({'A6': 'DPF-Net', 'A3': 'SP-UNet', 'A0': 'Baseline', 'A8': 'DPF-Lite',
-                      'U6': 'DPF-Net', 'U3': 'SP-UNet', 'U0': 'Baseline', 'U8': 'DPF-Lite'})
+        names.update({'B6': 'DPF-Net v2', 'B4': 'v1 fusion', 'B3': 'SP-UNet', 'B0': 'Baseline',
+                      'V6': 'DPF-Net v2', 'V4': 'v1 fusion', 'V3': 'SP-UNet', 'V0': 'Baseline'})
         # 1. validation IoU per epoch (line chart, <= 4 series, legend)
         curves = [(k, [(h['epoch'], h['val']['iou']) for h in runs[k]['hist'] if h.get('val')]) for k in series]
         curves = [(k, c) for k, c in curves if len(c) >= 2]
@@ -768,7 +824,7 @@ def make_figures(runs, summary, ci, out):
             plt.close(fig)
     # 3. ablation forest plot (single series: one hue, no legend; whiskers = 95% bootstrap CI)
     for subset in ('SAT', 'UAV'):
-        chain = [t for t in CHAIN[subset] if t in runs and t in ci]
+        chain = [t for t in CHAIN[subset] if t in summary['runs'] and t in ci]
         if len(chain) < 2:
             continue
         fig, ax = plt.subplots(figsize=(5.2, 0.34 * len(chain) + 0.9))
@@ -781,11 +837,11 @@ def make_figures(runs, summary, ci, out):
             lo, hi = 100 * ci[t][0], 100 * ci[t][1]
             ax.plot([lo, hi], [y, y], color=SLOTS[0], linewidth=1.5, solid_capstyle='round', zorder=2)
             ax.scatter([v], [y], s=34, color=SLOTS[0], edgecolors=SURFACE, linewidths=1.0, zorder=3)
-            if t in ('A0', 'A6', 'U0', 'U6'):
+            if t in ('B0', 'B3', 'B6', 'B6:lite', 'V0', 'V3', 'V6', 'V6:lite'):
                 ax.annotate(f'{v:.2f}', (hi, y), xytext=(5, 0), textcoords='offset points', va='center',
                             fontsize=8, color=INK2)
         ax.set_yticks(ys)
-        ax.set_yticklabels([f'{t}  {EXPERIMENTS[t]["title"] if t in EXPERIMENTS else t}' for t in chain], color=INK2)
+        ax.set_yticklabels([f'{t}  {summary["runs"][t]["configuration"]}' for t in chain], color=INK2)
         ax.set_xlabel('Test IoU (%) with 95% bootstrap interval')
         ax.set_title(f'CAS-{subset}: ablation', loc='left', color=INK)
         _save(fig, out, f'fig_ablation_{subset}')

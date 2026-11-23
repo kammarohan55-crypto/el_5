@@ -3,3 +3,5 @@ __pycache__/
 *.pyc
 smoke_test/_work/
 smoke_test/smoke_log.txt
+_diag/
+_runs/

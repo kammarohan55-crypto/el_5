@@ -26,24 +26,39 @@ def experiment_table():
     prio = {1: 'essential', 2: 'recommended', 3: 'optional'}
     lines = ['| ID | Subset | Experiment | Priority |', '|---|---|---|---|']
     for e in ablation.EXPERIMENTS.values():
-        lines.append(f'| `{e["id"]}` | {e["subset"]} | {e["title"]} | {prio[e["priority"]]} |')
+        p = 'import your earlier FP32 run' if e['id'] in ('R3', 'W3') else prio[e['priority']]
+        lines.append(f'| `{e["id"]}` | {e["subset"]} | {e["title"]} | {p} |')
     return '\n'.join(lines)
 
 
 INTRO = r'''
-# CAS Landslide segmentation — DPF-Net experiments (Kaggle, GPU T4 x2)
+# CAS Landslide segmentation — DPF-Net v2 experiments (Kaggle, GPU T4 x2)
 
-**DPF-Net (Dual-Prior Fusion Network)**: a ConvNeXt-T (DINOv3) UNet that combines
+**Why v2.** The v1 DPF-Net run (A6) reached 77.29 test IoU on CAS-SAT, below the earlier SP-UNet (79.41). The
+diagnosis (see `DIAGNOSIS.md` in the repository):
+1. **The comparison was confounded.** SP-UNet's 79.41 / 88.49 came from **FP32** reruns (log: `AMP False`), after the
+   **FP16** SP-UNet run diverged to NaN at epoch 18. A6 trained in FP16. The DINOv3 ConvNeXt-T has outlier
+   activations (up to 160x the mean at 1/16, layer-scale up to 23), and the v1 loop had no protection against an
+   overflowing FP16 forward. Corrupted BatchNorm statistics were also copied into the EMA weights.
+2. **The frozen-feature fusion is a shortcut.** Under the same FP16 precision, A6 was 1.5–3.8 IoU *ahead* of SP-UNet in
+   every epoch from 2 to 17. It still finished lower, in all nine regions, which points to a global effect rather than a
+   sensor-specific one. The decoder leans on the frozen 1/16-resolution ViT features and the trainable CNN path
+   learns less.
+3. **The ViT-L costs 10x the inference FLOPs** (812 vs 80 GFLOPs) and about 60 % of the training step.
 
-* a **spectral-structural prior**: 10 differentiable descriptors that feed a high-resolution stem;
-* a **semantic prior**: multi-layer features of a **frozen satellite foundation model** (DINOv3 ViT-L/16, SAT-493M),
-  injected into the 1/8, 1/16 and 1/32 encoder features by **structure-aware gated fusion**;
-* **semantic hard-negative mining**: anchors of the pixel-contrastive loss chosen both by the current prediction
-  errors and by foundation-model similarity to landslides (bare soil, river beds, roads, ...);
-* **DPF-Lite**: the same foundation model used only during training (feature distillation + mining), so it adds no
-  inference cost.
+**DPF-Net v2** keeps the two priors and fixes the failure modes:
+* **spectral-structural prior** (10 differentiable descriptors → high-resolution stem) + boundary head + error-mined
+  pixel contrast (= SP-UNet);
+* **semantic prior** of a frozen satellite foundation model (DINOv3 ViT-L/16 SAT-493M), injected at 1/8, 1/16 and
+  1/32 by **structure-aware gated fusion**;
+* **stochastic prior substitution (new)**: in every batch the real prior of a random half of the tiles is replaced by
+  a **hallucinated prior** that the network predicts from its own CNN features (trained to match the real prior). This
+  removes the shortcut, halves the foundation-model cost in training, and lets the *same* network run **without the
+  foundation model** at test time (`:lite` rows, about 80 GFLOPs like SP-UNet);
+* **overflow-safe mixed precision (`--precision auto`)**: FP16 speed, but a step whose FP16 forward overflows is
+  undone and recomputed in FP32. All rows below use it, so they differ only in the component under test.
 
-`--fm none` reproduces the earlier SP-UNet bit for bit.
+`--fm none` reproduces SP-UNet and `--fm-sub none` reproduces the v1 DPF-Net, bit for bit.
 
 **One notebook, all experiments.** Each *Save & Run All* trains the experiments in `QUEUE`, in order, until the 12 h
 session is nearly used up. Every run checkpoints. To continue in a new session, attach this notebook's previous
@@ -54,39 +69,52 @@ and the tables and figures are rebuilt from everything found.
 1. *Settings → Accelerator → GPU T4 x2*, *Settings → Internet → On*.
 2. *Add Input →* dataset **`ngxunninh/cas-landslide`**.
 3. From the 2nd session on: *Add Input → Your Work →* this notebook (its latest output).
-4. Optional, to reuse your earlier SP-UNet runs as rows A3 / U3 without retraining: *Add Input →* the notebook
-   versions that produced them, then set `IMPORT` in CONFIG. They are re-evaluated (≈20 min each), not retrained.
-5. Edit CONFIG → *Save Version → Save & Run All (Commit)*.
+4. Recommended: attach the notebook versions with your earlier **FP32** SP-UNet runs and set `IMPORT` so they become
+   the reference rows `R3` (SAT) / `W3` (UAV). Imported rows are re-evaluated (≈20 min each), not retrained.
+5. Edit CONFIG → *Save Version → Save & Run All (Commit)*. Run once with `QUICK_TEST = True` first (≈25 min) to
+   measure the epoch time.
 
 ### Experiments
 EXPERIMENT_TABLE
 
-All rows share the encoder, the 80-epoch schedule, seed 42 and the evaluation protocol. The protocol: the
-checkpoint, the decision threshold and the TTA mode are chosen on validation only; the ablation table compares D4-TTA
-at the validation threshold.
+All rows share the encoder, the 80-epoch schedule, seed 42, the precision mode (except `P0`, `R3`, `W3`) and the
+evaluation protocol. The checkpoint, the decision threshold and the TTA mode are chosen on validation only. The
+ablation table compares D4-TTA at the validation threshold. Rows with prior substitution are also reported as
+`<id>:lite`, evaluated without the foundation model.
 
-**Cost.** Runs without a foundation model (A0–A3, U0, U3) take as long as your earlier SP-UNet runs. Runs with the
-ViT-L foundation model take about 1.3–1.6× longer, because they add one frozen forward pass per image. UAV runs take
-about 1.8× longer than SAT runs. After epoch 1 the log prints the measured epoch time and the projected total. A run
-that does not fit in a session pauses and resumes in the next one.
+**Cost (estimated, T4 x2; the log prints the measured epoch time and projection after epoch 1).** These are
+inferred from the earlier runs:
 
-Suggested order: `A6` (main SAT result) → `A0`, `A5`, `A7` → `U6` (main UAV result) → `A4`, `A8`, `A9` → `A1`,
-`A2` → `S1`, `S2`, `U0`, `U8`. Import `A3` / `U3` from your SP-UNet runs. With two Kaggle accounts, give each a
-different `QUEUE`, then run the collect cell on all outputs.
+| Rows | Time per row |
+|---|---|
+| B0–B3, P0 | ≈ 3–3.5 h (2.4 min/epoch measured for FP16 SP-UNet) |
+| B5, B6, B7, B9, C6, G6, S1, S2 | ≈ 6–6.5 h (ViT-L on half of each batch, plus Lite evaluation) |
+| B4, B8 | ≈ 8–8.5 h (ViT-L on every image; A6 measured 5.8 min/epoch) |
+| UAV rows | ≈ 1.8× the SAT rows |
+| FP32 rows (R3, W3) | ≈ 3.5× FP16; prefer `IMPORT` |
+
+A run that does not fit in a session pauses and resumes in the next one.
+
+**Suggested order** (two Kaggle accounts, one `QUEUE` each):
+* account 1: `['B3', 'B6']` → `['V6']` → `['B5', 'B7']` → `['C6', 'S1', 'S2']`;
+* account 2: `['B4', 'B0']` → `['V3', 'B8']` → `['B1', 'B2', 'P0']` → `['V0', 'V4', 'B9', 'G6']`.
+
+Then download every `runs/<ID>` folder (the small files are enough) into one folder and run the collect cell, or
+`python ablation.py collect --roots <folder> --out ablation`.
 '''
 
 CONFIG = r'''
 import time
 NB_T0 = time.time()          # session start - the queue keeps every run inside the 12 h Kaggle limit
 # ================================ CONFIG ================================
-QUEUE = ['A6']               # experiment ids, run in this order (table above); e.g. ['A6', 'A0', 'A5']
+QUEUE = ['B3', 'B6']         # experiment ids, run in this order (table above); account 2: ['B4', 'B0']
 EPOCHS = 80                  # identical for every row (the SP-UNet results used 80)
 BATCH_PER_GPU = 8            # global batch = 16 on T4 x2; use 6 if CUDA runs out of memory
 SESSION_HOURS = 11.5         # Kaggle stops sessions at 12 h; the queue stops cleanly before this
 EXTRA_ARGS = ''              # appended to every run, e.g. '--grad-ckpt'
-IMPORT = {}                  # reuse finished SP-UNet checkpoints instead of retraining, e.g.
-# IMPORT = {'A3': '/kaggle/input/<sat-notebook>/runs/sat_spunet_convnext_t_dinov3_fp32_rerun/best.pth',
-#           'U3': '/kaggle/input/<uav-notebook>/runs/sat_spunet_convnext_t_dinov3_fp32_rerun/best.pth'}
+IMPORT = {}                  # earlier FP32 SP-UNet checkpoints as the precision reference rows, e.g.
+# IMPORT = {'R3': '/kaggle/input/<sat-notebook>/runs/sat_spunet_convnext_t_dinov3_fp32_rerun/best.pth',
+#           'W3': '/kaggle/input/<uav-notebook>/runs/sat_spunet_convnext_t_dinov3_fp32_rerun/best.pth'}
 QUICK_TEST = False           # True: 1 epoch of QUEUE[0] (+ its evaluation) to measure time and memory
 WORK = '/kaggle/working'
 PREV = ['/kaggle/input']     # earlier outputs attached as inputs are found here automatically
@@ -165,8 +193,16 @@ NEXT = r'''
   `history.json`, `per_tile_test.csv`, `best.pth` and `vis_test/`.
 * **Two accounts**: run different queues, download each `runs/<ID>` folder (the small files are enough), put them in
   one folder and run locally: `python ablation.py collect --roots <folder> --out ablation`.
-* **Single custom run**: `python train_landslide.py --help` lists every option. `--fm none` gives SP-UNet,
-  `--fm-mode distill` gives DPF-Lite, and `--ms-tta` adds multi-scale TTA (chosen on validation).
+* **Reading the log**:
+  * `no-FM val IoU` is the same network evaluated without the foundation model.
+  * `FP32 recomputes N` counts FP16 steps that overflowed and were redone in FP32. With
+    `--precision auto` this is harmless. If it happens often, the run switches to FP32 by itself.
+* **Single custom run**: `python train_landslide.py --help` lists every option:
+  * `--fm none`: SP-UNet;
+  * `--fm-sub none`: v1 DPF-Net;
+  * `--fm-sub zero`: prior dropout;
+  * `--fm-mode distill`: feature distillation only;
+  * `--precision fp32`: full FP32.
 '''
 
 

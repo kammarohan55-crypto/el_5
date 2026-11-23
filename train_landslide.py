@@ -7,12 +7,19 @@ Model  : timm CNN encoder (default ConvNeXt-T, DINOv3) + PPM context + scSE UNet
          * semantic prior   - multi-layer features of a frozen remote-sensing foundation ViT
            (default DINOv3 ViT-L/16 SAT-493M) injected into the 1/8, 1/16, 1/32 encoder features by
            structure-aware gated fusion ('fuse'), or used only during training ('distill', no inference cost);
+         * prior substitution ('--fm-sub', v2): during training the real prior of a random half of every batch is
+           replaced - by nothing ('zero' = prior dropout) or by a prior the network hallucinates from its own
+           features ('hal' = prior hallucination, trained to match the real prior). This removes the shortcut through
+           the frozen features, and a 'hal' model also runs WITHOUT the foundation model ('lite' inference);
          + boundary head + deep supervision + pixel contrastive head with error- and foundation-guided
-           hard-anchor mining.  '--fm none' gives the earlier SP-UNet exactly.
-Train  : DDP (torchrun), FP16 autocast + dynamic GradScaler, AdamW, warmup + cosine,
-         EMA weights, GPU augmentation, time budget with resume.
+           hard-anchor mining.  '--fm none' gives the earlier SP-UNet exactly; '--fm-sub none' the v1 DPF-Net.
+Train  : DDP (torchrun), AdamW, warmup + cosine, EMA weights, GPU augmentation, time budget with resume.
+         Precision '--precision auto' (default): FP16 autocast + GradScaler, but a step whose FP16 forward
+         overflows is restored (BatchNorm statistics) and recomputed in FP32, and a run that overflows often
+         switches to FP32 - so FP16 can never corrupt the model (the earlier plain-FP16 SP-UNet run diverged).
 Eval   : EMA weights, dataset-level confusion counts, D4 (+ optional multi-scale) test-time augmentation,
-         TTA mode and threshold selected on the validation split only, per-region and per-tile counts.
+         TTA mode and threshold selected on the validation split only, per-region and per-tile counts; models
+         with prior substitution are evaluated with ('full') and without ('lite') the foundation model.
 
 Kaggle (GPU T4 x2):
   NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 python -m torch.distributed.run --standalone \
@@ -56,13 +63,22 @@ except Exception:  # noqa: BLE001
 
 SWEEP_THRESHOLDS = [round(0.30 + 0.025 * i, 3) for i in range(17)]  # 0.300 ... 0.700 (contains 0.5)
 ARCH_KEYS = ('encoder', 'img_size', 'no_hires', 'no_prior', 'no_attention', 'fm', 'fm_mode', 'fm_fusion',
-             'fm_channels', 'fm_layers', 'fm_size')
-# values assumed for arguments that checkpoints / results of the earlier SP-UNet version do not contain
+             'fm_channels', 'fm_layers', 'fm_size', 'fm_sub')
+# values assumed for arguments that checkpoints / results of earlier versions (SP-UNet, DPF-Net v1) do not contain
 LEGACY_DEFAULTS = {'fm': 'none', 'fm_mode': 'fuse', 'fm_fusion': 'gated', 'fm_channels': 256, 'fm_layers': 4,
                    'fm_size': 0, 'hard_mining': 'error', 'distill_weight': 0.0, 'ms_tta': False,
-                   'ms_scales': [0.75, 1.0, 1.25], 'tag': ''}
+                   'ms_scales': [0.75, 1.0, 1.25], 'tag': '', 'fm_sub': 'none', 'fm_sub_p': 0.5, 'hal_weight': 0.0,
+                   'precision': 'fp16', 'select_prior': 'full'}
 TRAIN_ONLY_HEADS = ('aux4', 'aux8', 'bnd_head', 'proj', 'distill_head')
 MODE_LABELS = {'noTTA': 'no TTA', 'TTA': 'D4-TTA', 'MSTTA': 'D4+MS-TTA'}
+LITE = '-lite'  # suffix of the evaluation modes run without the foundation model (hallucinated / no prior)
+
+
+def mode_label(mode):
+    """'TTA' -> 'D4-TTA'; 'TTA-lite' -> 'D4-TTA, no FM at inference'."""
+    if mode.endswith(LITE):
+        return MODE_LABELS[mode[:-len(LITE)]] + ', no FM at inference'
+    return MODE_LABELS[mode]
 
 
 def arg(ns, key):
@@ -518,6 +534,32 @@ class SemanticInjection(nn.Module):
         return c + g * fp
 
 
+def inject_rows(inj, c, f, s, rows):
+    """Applies the injection only to the samples `rows` of the batch (prior dropout); the others keep c."""
+    if rows is None or rows.numel() == c.shape[0]:
+        return inj(c, f, s)
+    if rows.numel() == 0:
+        return c
+    new = inj(c.index_select(0, rows), f, None if s is None else s.index_select(0, rows))
+    return c.index_copy(0, rows, new.to(c.dtype))
+
+
+class PriorHallucination(nn.Module):
+    """Predicts the adapted foundation-model prior f (fm_channels at the foundation-model grid) from the CNN's own
+    1/16 and 1/32 features. Trained to match the real prior (stop-gradient target) and, through prior substitution,
+    by the segmentation loss itself - so at inference the network can run without the foundation model."""
+
+    def __init__(self, c16, c32, cf):
+        super().__init__()
+        self.net = nn.Sequential(nn.Conv2d(c16 + c32, cf, 1, bias=False), nn.BatchNorm2d(cf), nn.GELU(),
+                                 nn.Conv2d(cf, cf, 3, padding=1, bias=False), nn.BatchNorm2d(cf), nn.GELU(),
+                                 nn.Conv2d(cf, cf, 1))
+
+    def forward(self, c16, c32, size):
+        up = F.interpolate(c32, size=c16.shape[-2:], mode='bilinear', align_corners=False).to(c16.dtype)
+        return _resize(self.net(torch.cat([c16, up], 1)), size)
+
+
 class DualPriorUNet(nn.Module):
     """UNet decoder over a timm CNN encoder with two optional priors (see the module docstring).
     fm=None reproduces the earlier Structural-Prior UNet (SP-UNet) exactly."""
@@ -525,12 +567,18 @@ class DualPriorUNet(nn.Module):
     def __init__(self, encoder='convnext_tiny.dinov3_lvd1689m', pretrained=True, hires=True, prior=True,
                  boundary=True, contrast=True, deep_sup=True, attention=True, proj_dim=64, grad_ckpt=False,
                  fm=None, fm_pretrained=True, fm_mode='fuse', fm_fusion='gated', fm_channels=256, fm_layers=4,
-                 fm_scale=1.0):
+                 fm_scale=1.0, fm_sub='none', fm_sub_p=0.5):
         super().__init__()
         if prior and not hires:
             raise ValueError('The structural prior needs the high-resolution stem (use --no-prior with --no-hires).')
         if fm_mode not in ('fuse', 'distill') or fm_fusion not in ('gated', 'add'):
             raise ValueError(f'unknown fm_mode / fm_fusion: {fm_mode} / {fm_fusion}')
+        if fm_sub not in ('none', 'zero', 'hal'):
+            raise ValueError(f'unknown fm_sub: {fm_sub}')
+        if fm_sub != 'none' and not (fm_enabled(fm) and fm_mode == 'fuse'):
+            raise ValueError('prior substitution (--fm-sub zero / hal) needs --fm <model> --fm-mode fuse')
+        if not 0.0 <= float(fm_sub_p) < 1.0:
+            raise ValueError('--fm-sub-p must be in [0, 1)')
         self.hires, self.use_prior = hires, prior
         self.encoder = Encoder(encoder, pretrained, grad_ckpt)
         c4, c8, c16, c32 = self.encoder.channels
@@ -566,8 +614,10 @@ class DualPriorUNet(nn.Module):
         # ---- semantic prior (created after all SP-UNet modules, so their initialisation is unchanged) ----
         self.fm_name = fm if fm_enabled(fm) else None
         self.fm_mode, self.fm_pretrained, self.fm_scale = fm_mode, bool(fm_pretrained), float(fm_scale)
+        self.fm_sub, self.fm_sub_p = (fm_sub if self.fm_name else 'none'), float(fm_sub_p)
         self.fm_fallbacks = 0
         self.distill_head = None
+        self.hal = None
         if self.fm_name:
             vit = get_foundation(self.fm_name, self.fm_pretrained)
             ps = vit.patch_embed.patch_size
@@ -592,9 +642,38 @@ class DualPriorUNet(nn.Module):
                 self.inj8 = SemanticInjection(c8, fm_channels, cs, gated)
                 self.inj16 = SemanticInjection(c16, fm_channels, cs, gated)
                 self.inj32 = SemanticInjection(c32, fm_channels, cs, gated)
+                if self.fm_sub == 'hal':  # created last: the v1 modules keep their initialisation
+                    self.hal = PriorHallucination(c16, c32, fm_channels)
             else:  # distill: predict the foundation features from the CNN's 1/16 features (training only)
                 self.distill_head = nn.Sequential(nn.Conv2d(c16, 256, 1, bias=False), nn.BatchNorm2d(256), nn.GELU(),
                                                   nn.Conv2d(256, self.fm_dim, 1))
+
+    def fm_grid(self, H, W):
+        """(foundation-model input size, feature grid) for an HxW tile."""
+        ps = self.fm_patch
+        h = max(ps, int(round(H * self.fm_scale / ps)) * ps)
+        w = max(ps, int(round(W * self.fm_scale / ps)) * ps)
+        return (h, w), (h // ps, w // ps)
+
+    @property
+    def needs_fm(self):
+        """True if the default ('full') inference runs the foundation model."""
+        return bool(self.fm_name) and self.fm_mode == 'fuse'
+
+    @property
+    def lite_capable(self):
+        """True if the network can also run without the foundation model ('lite' inference)."""
+        return (not self.needs_fm) or self.fm_sub in ('zero', 'hal')
+
+    def _prior_rows(self, B, device):
+        """Training: sorted indices of the samples that get the real foundation prior (None = all). The others
+        (round(fm_sub_p * B), at most B - 1, so every rank always runs the same prior modules) are substituted."""
+        if self.fm_sub == 'none':
+            return None
+        n_off = min(B - 1, max(0, int(round(self.fm_sub_p * B))))
+        if n_off <= 0:
+            return None
+        return torch.randperm(B, device=device)[n_off:].sort().values
 
     @torch.no_grad()
     def foundation_features(self, x):
@@ -604,9 +683,7 @@ class DualPriorUNet(nn.Module):
         if next(vit.parameters()).device != x.device:
             vit.to(x.device)
         H, W = x.shape[-2:]
-        ps = self.fm_patch
-        h = max(ps, int(round(H * self.fm_scale / ps)) * ps)
-        w = max(ps, int(round(W * self.fm_scale / ps)) * ps)
+        (h, w), _ = self.fm_grid(H, W)
         xi = x.float()
         if (h, w) != (H, W):
             xi = F.interpolate(xi, size=(h, w), mode='bilinear', align_corners=False, antialias=h < H)
@@ -619,10 +696,13 @@ class DualPriorUNet(nn.Module):
             self.fm_fallbacks += 1
         return feats
 
-    def forward(self, x):
-        """x: Bx3xHxW RGB in [0,1] (float32). Training: dict with seg/aux4/aux8/bnd/emb (+ fm_sem / distill
-        with a foundation model); eval: {'seg'}."""
+    def forward(self, x, prior=None):
+        """x: Bx3xHxW RGB in [0,1] (float32). prior (inference only): 'full' / None = real foundation prior,
+        'lite' = no foundation model (hallucinated prior with --fm-sub hal, no prior with --fm-sub zero); during
+        training the prior is substituted per sample (--fm-sub). Training: dict with seg/aux4/aux8/bnd/emb
+        (+ fm_sem [+ fm_rows] / distill / hal + hal_target with a foundation model); eval: {'seg'}."""
         H, W = x.shape[-2:]
+        B = x.shape[0]
         xn = (x - self.encoder.mean) / self.encoder.std
         c4, c8, c16, c32 = self.encoder(xn)
         p1 = p2 = p4 = None
@@ -637,16 +717,45 @@ class DualPriorUNet(nn.Module):
             p4 = self.stem4(p2)
             if p4.shape[-2:] != c4.shape[-2:]:
                 p4 = F.interpolate(p4, size=c4.shape[-2:], mode='bilinear', align_corners=False)
-        fm_sem = None
-        if self.fm_name and (self.fm_mode == 'fuse' or self.training):
-            feats = self.foundation_features(x)
+        extra = {}
+        if self.needs_fm:
             if self.training:
-                fm_sem = F.normalize(feats[-1], dim=1)
-            if self.fm_mode == 'fuse':
-                f = self.fm_adapter(torch.cat(feats, 1))
-                c8 = self.inj8(c8, f, p4)
-                c16 = self.inj16(c16, f, p4)
-                c32 = self.inj32(c32, f, p4)
+                rows = self._prior_rows(B, x.device)  # samples with the real prior (None = all)
+            else:
+                if prior not in (None, 'full', 'lite'):
+                    raise ValueError(f'unknown prior {prior!r}')
+                if prior == 'lite' and not self.lite_capable:
+                    raise ValueError('this model was trained without prior substitution and needs the foundation model')
+                rows = x.new_zeros(0, dtype=torch.long) if prior == 'lite' else None
+            n_on = B if rows is None else rows.numel()
+            f_on = f_hal = None
+            if n_on > 0:
+                feats = self.foundation_features(x if rows is None else x.index_select(0, rows))
+                if self.training:
+                    extra['fm_sem'] = F.normalize(feats[-1], dim=1)
+                    if rows is not None:
+                        extra['fm_rows'] = rows
+                f_on = self.fm_adapter(torch.cat(feats, 1))
+            if self.hal is not None and (self.training or n_on < B):
+                grid = f_on.shape[-2:] if f_on is not None else self.fm_grid(H, W)[1]
+                f_hal = self.hal(c16, c32, grid)
+                if self.training and f_on is not None:
+                    extra['hal'] = f_hal if rows is None else f_hal.index_select(0, rows)
+                    extra['hal_target'] = f_on.detach()
+            inj_rows = None
+            if rows is None:  # every sample has the real prior (v1 DPF-Net path)
+                f = f_on
+            elif self.fm_sub == 'hal':  # substituted samples use the hallucinated prior
+                f = f_hal if n_on == 0 else f_hal.index_copy(0, rows, f_on.to(f_hal.dtype))
+            else:  # 'zero': prior dropout - only the samples with the real prior are injected
+                f, inj_rows = f_on, rows
+            if f is not None:
+                c8 = inject_rows(self.inj8, c8, f, p4, inj_rows)
+                c16 = inject_rows(self.inj16, c16, f, p4, inj_rows)
+                c32 = inject_rows(self.inj32, c32, f, p4, inj_rows)
+        elif self.fm_name and self.training:  # distill: foundation model only as a training target
+            feats = self.foundation_features(x)
+            extra['fm_sem'] = F.normalize(feats[-1], dim=1)
         d16 = self.dec16(self.ppm(c32), c16)
         d8 = self.dec8(d16, c8)
         d4 = self.dec4(d8, c4 if p4 is None else torch.cat([c4, p4.to(c4.dtype)], 1))
@@ -667,8 +776,7 @@ class DualPriorUNet(nn.Module):
                 out['bnd'] = b
             if self.proj is not None:
                 out['emb'] = self.proj(d4)
-            if fm_sem is not None:
-                out['fm_sem'] = fm_sem
+            out.update(extra)
             if self.distill_head is not None:
                 out['distill'] = self.distill_head(c16)
         return out
@@ -681,8 +789,16 @@ class Ensemble(nn.Module):
         super().__init__()
         self.models = nn.ModuleList(models)
 
-    def forward(self, x):
-        p = torch.stack([torch.sigmoid(m(x)['seg'].float()) for m in self.models]).mean(0)
+    @property
+    def needs_fm(self):
+        return any(getattr(m, 'needs_fm', False) for m in self.models)
+
+    @property
+    def lite_capable(self):
+        return all(getattr(m, 'lite_capable', True) for m in self.models)
+
+    def forward(self, x, prior=None):
+        p = torch.stack([torch.sigmoid(m(x, prior=prior)['seg'].float()) for m in self.models]).mean(0)
         return {'seg': torch.logit(p.clamp(1e-6, 1 - 1e-6))}
 
 
@@ -697,7 +813,15 @@ def build_model(a, pretrained):
         grad_ckpt=getattr(a, 'grad_ckpt', False),
         fm=arg(a, 'fm'), fm_pretrained=not getattr(a, 'no_pretrained', False), fm_mode=arg(a, 'fm_mode'),
         fm_fusion=arg(a, 'fm_fusion'), fm_channels=int(arg(a, 'fm_channels')), fm_layers=int(arg(a, 'fm_layers')),
-        fm_scale=(fm_size / a.img_size) if fm_size else 1.0)
+        fm_scale=(fm_size / a.img_size) if fm_size else 1.0, fm_sub=arg(a, 'fm_sub'), fm_sub_p=arg(a, 'fm_sub_p'))
+
+
+def run_precision(margs):
+    """Training precision of a run (older runs: FP16 autocast unless --no-amp)."""
+    g = margs if isinstance(margs, dict) else vars(margs)
+    if g.get('precision'):
+        return g['precision']
+    return 'fp32' if g.get('no_amp') else 'fp16'
 
 
 # ----------------------------------------------------------------------------------------
@@ -797,7 +921,9 @@ def pixel_contrast_loss(emb, seg_logits, mask, n_per_class=256, temperature=0.1,
         sem_p = sem_n = pos
         if use_sem:
             s = F.interpolate(sem_score.float(), size=(h, w), mode='bilinear', align_corners=False).flatten()
-            sem_p, sem_n = _top_frac(pos, -s, sem_frac), _top_frac(neg, s, sem_frac)
+            ok = torch.isfinite(s)  # samples whose prior was substituted have no foundation features (NaN)
+            s = torch.nan_to_num(s, nan=0.0)
+            sem_p, sem_n = _top_frac(pos & ok, -s, sem_frac), _top_frac(neg & ok, s, sem_frac)
         if mining == 'random':
             none = torch.zeros_like(pos)
             idx_p, idx_n = _sample_idx(pos, none, n_per_class), _sample_idx(neg, none, n_per_class)
@@ -823,8 +949,26 @@ def pixel_contrast_loss(emb, seg_logits, mask, n_per_class=256, temperature=0.1,
     return loss.mean() + zero
 
 
+def semantic_score(out, mask):
+    """Foundation-model landslide-likeness for every sample of the batch; NaN for samples whose prior was
+    substituted (no foundation features this step)."""
+    rows = out.get('fm_rows')
+    if rows is None:
+        return fm_semantic_score(out['fm_sem'], mask)
+    s_on = fm_semantic_score(out['fm_sem'], mask.index_select(0, rows))
+    s = s_on.new_full((mask.shape[0],) + tuple(s_on.shape[1:]), float('nan'))
+    return s.index_copy(0, rows, s_on)
+
+
+def hallucination_loss(pred, target):
+    """Normalised MSE between the hallucinated and the real (adapted, stop-gradient) foundation prior."""
+    pred, target = pred.float(), target.float().detach()
+    return (pred - target).pow(2).mean() / (target.pow(2).mean() + 1e-6)
+
+
 def compute_loss(out, mask, a):
-    """Returns (total_loss, vector [seg, aux4, aux8, bnd, con, dis]) in FP32."""
+    """Returns (total_loss, vector [seg, aux4, aux8, bnd, con, dis]) in FP32 ('dis' = feature distillation in
+    --fm-mode distill, prior hallucination with --fm-sub hal)."""
     zero = torch.zeros((), device=mask.device)
     l_seg = bce_dice(out['seg'], mask)
     total = l_seg
@@ -839,8 +983,7 @@ def compute_loss(out, mask, a):
         total = total + a.boundary_weight * l_bnd
     if 'emb' in out:
         mining = arg(a, 'hard_mining')
-        sem = (fm_semantic_score(out['fm_sem'], mask)
-               if mining in ('fm', 'error+fm') and 'fm_sem' in out else None)
+        sem = semantic_score(out, mask) if mining in ('fm', 'error+fm') and 'fm_sem' in out else None
         l_con = pixel_contrast_loss(out['emb'], out['seg'], mask, a.contrast_anchors, a.contrast_temp,
                                     mining=mining, sem_score=sem)
         total = total + a.contrast_weight * l_con
@@ -848,6 +991,9 @@ def compute_loss(out, mask, a):
         pred = _resize(out['distill'].float(), out['fm_sem'].shape[-2:])
         l_dis = (1.0 - F.cosine_similarity(pred, out['fm_sem'].float(), dim=1)).mean()
         total = total + arg(a, 'distill_weight') * l_dis
+    if 'hal' in out and 'hal_target' in out:
+        l_dis = hallucination_loss(out['hal'], out['hal_target'])
+        total = total + arg(a, 'hal_weight') * l_dis
     parts = torch.stack([l_seg.detach(), l_a4.detach(), l_a8.detach(), l_bnd.detach(), l_con.detach(),
                          l_dis.detach()])
     return total, parts
@@ -948,16 +1094,24 @@ def metrics_from_counts(tp, fp, fn, tn):
 
 
 @torch.no_grad()
-def predict_modes(model, x, modes, amp, channels_last, ms_scales=(0.75, 1.0, 1.25)):
+def predict_modes(model, x, modes, amp, channels_last, ms_scales=(0.75, 1.0, 1.25), prior=None):
     """x: Bx3xHxW float in [0,1]. Returns {mode: Bx1xHxW FP32 probabilities} for modes in
     {'noTTA', 'TTA', 'MSTTA'}, sharing forward passes: noTTA is the identity pass among the 8 D4 passes, TTA
     their mean, MSTTA the mean over scales of [TTA at scale 1, flip-averaged prediction at every other scale]
-    (8 + 2 per extra scale forward passes)."""
+    (8 + 2 per extra scale forward passes). prior: passed to the model ('full' / 'lite'), None = default.
+    A pass whose FP16 output is not finite is recomputed in FP32."""
+
+    def call(inp):
+        return model(inp) if prior is None else model(inp, prior=prior)
 
     def run(inp):
         inp = inp.contiguous(memory_format=torch.channels_last) if channels_last else inp.contiguous()
         with torch.autocast(device_type=inp.device.type, dtype=torch.float16, enabled=amp):
-            return torch.sigmoid(model(inp)['seg'].float())
+            logits = call(inp)['seg'].float()
+        if amp and not bool(torch.isfinite(logits).all()):
+            with torch.autocast(device_type=inp.device.type, enabled=False):
+                logits = call(inp)['seg'].float()
+        return torch.sigmoid(logits)
 
     modes = set(modes)
     if not modes & {'TTA', 'MSTTA'}:
@@ -994,19 +1148,19 @@ def predict_modes(model, x, modes, amp, channels_last, ms_scales=(0.75, 1.0, 1.2
     return out
 
 
-def predict_probs(model, x, tta, amp, channels_last):
+def predict_probs(model, x, tta, amp, channels_last, prior=None):
     """x: Bx3xHxW float in [0,1]. Returns Bx1xHxW FP32 probabilities (D4-TTA averaged if tta)."""
     mode = 'TTA' if tta else 'noTTA'
-    return predict_modes(model, x, (mode,), amp, channels_last)[mode]
+    return predict_modes(model, x, (mode,), amp, channels_last, prior=prior)[mode]
 
 
 @torch.no_grad()
 def evaluate(model, loader, d, a, modes=('noTTA',), thresholds=None, region_ids=None, n_regions=0, sink=None,
-             sink_mode=None, per_tile=False):
+             sink_mode=None, per_tile=False, prior=None):
     """Dataset-level confusion counts [tp, fp, fn, tn] for every prediction mode and threshold (and per region /
     per tile), summed over all ranks. thresholds: {mode: [t, ...]} (default [0.5]); per-tile counts use the last
-    threshold of each mode. Returns {'counts': {mode: T x 4}, 'regions': {mode: R x T x 4} | None,
-    'tiles': {mode: N x 4} | None} (CPU, float64)."""
+    threshold of each mode. prior: 'full' / 'lite' / None (model default). Returns {'counts': {mode: T x 4},
+    'regions': {mode: R x T x 4} | None, 'tiles': {mode: N x 4} | None} (CPU, float64)."""
     model.eval()
     modes = list(modes)
     ths = {m: list((thresholds or {}).get(m, [0.5])) for m in modes}
@@ -1020,7 +1174,7 @@ def evaluate(model, loader, d, a, modes=('noTTA',), thresholds=None, region_ids=
     for img, mask, idx in loader:
         x = img.to(dev, non_blocking=True).float().div_(255.0)
         y = mask.to(dev, non_blocking=True) > 0
-        probs = predict_modes(model, x, modes, a.amp, a.channels_last, ms_scales)
+        probs = predict_modes(model, x, modes, a.amp, a.channels_last, ms_scales, prior=prior)
         B = x.shape[0]
         yf = y.reshape(B, -1)
         npx = float(yf.shape[1])
@@ -1095,25 +1249,39 @@ def param_report(model):
             if isinstance(mod, nn.Module):
                 heads += sum(p.numel() for p in mod.parameters())
     fm_infer, fm_train = {}, {}
+    hal = adapter = inj = 0
     for net in nets:
         if net.fm_name:
             n = sum(p.numel() for p in get_foundation(net.fm_name, net.fm_pretrained).parameters())
             (fm_infer if net.fm_mode == 'fuse' else fm_train)[net.fm_name] = n
+        if net.hal is not None:
+            hal += sum(p.numel() for p in net.hal.parameters())
+        if net.needs_fm:
+            adapter += sum(p.numel() for p in net.fm_adapter.parameters())
+            if net.fm_sub == 'zero':  # without the foundation model nothing is injected
+                inj += sum(p.numel() for n_ in ('inj8', 'inj16', 'inj32') for p in getattr(net, n_).parameters())
     fm_i = sum(fm_infer.values())
-    return {'params_M': total / 1e6, 'train_only_heads_M': heads / 1e6, 'fm_frozen_params_M': fm_i / 1e6,
-            'fm_training_only_params_M': sum(fm_train.values()) / 1e6,
-            'inference_params_M': (total - heads + fm_i) / 1e6}
+    rep = {'params_M': total / 1e6, 'train_only_heads_M': heads / 1e6, 'fm_frozen_params_M': fm_i / 1e6,
+           'fm_training_only_params_M': sum(fm_train.values()) / 1e6,
+           'inference_params_M': (total - heads - hal + fm_i) / 1e6}
+    if fm_i and all(n.lite_capable for n in nets):
+        rep['inference_params_lite_M'] = (total - heads - adapter - inj) / 1e6
+    return rep
 
 
 @torch.no_grad()
-def model_stats(model, size, device, amp, channels_last=False):
+def model_stats(model, size, device, amp, channels_last=False, prior=None):
     stats = param_report(model)
     model.eval()
+
+    def call(inp):
+        return model(inp) if prior is None else model(inp, prior=prior)
+
     try:
         from torch.utils.flop_counter import FlopCounterMode
         x = torch.rand(1, 3, size, size, device=device)
         with FlopCounterMode(display=False) as fc:
-            model(x)
+            call(x)
         flops = fc.get_total_flops()
         stats['gflops'] = flops / 1e9
         stats['gmacs'] = flops / 2e9
@@ -1125,12 +1293,12 @@ def model_stats(model, size, device, amp, channels_last=False):
             x = x.contiguous(memory_format=torch.channels_last)
         for _ in range(3):
             with torch.autocast('cuda', dtype=torch.float16, enabled=amp):
-                model(x)
+                call(x)
         torch.cuda.synchronize(device)
         t0, n_it = time.time(), 10
         for _ in range(n_it):
             with torch.autocast('cuda', dtype=torch.float16, enabled=amp):
-                model(x)
+                call(x)
         torch.cuda.synchronize(device)
         stats['fps_batch8'] = 8 * n_it / (time.time() - t0)
         stats['gpu'] = torch.cuda.get_device_name(device)
@@ -1166,12 +1334,19 @@ def fmt(v):
     return '-' if v is None else f'{v:.2f}'
 
 
+SUB_LABELS = {'none': '', 'zero': ', prior dropout', 'hal': ', prior hallucination'}
+
+
 def describe_semantic_prior(margs):
     fm = arg(margs, 'fm')
     if not fm_enabled(fm):
         return 'none'
     mode = arg(margs, 'fm_mode')
-    return f'`{fm}` ({mode}' + (f', {arg(margs, "fm_fusion")} fusion)' if mode == 'fuse' else ', training only)')
+    if mode != 'fuse':
+        return f'`{fm}` ({mode}, training only)'
+    sub = arg(margs, 'fm_sub') or 'none'
+    extra = SUB_LABELS.get(sub, f', {sub}') + (f' p={arg(margs, "fm_sub_p")}' if sub != 'none' else '')
+    return f'`{fm}` ({mode}, {arg(margs, "fm_fusion")} fusion{extra})'
 
 
 def results_markdown(res, subset):
@@ -1179,8 +1354,9 @@ def results_markdown(res, subset):
     main_mode = res.get('tta_mode', 'TTA' if res.get('tta') else 'noTTA')
     lines = [f'# Results - {res["run"]}', '',
              f'Encoder `{arg(margs, "encoder")}`; semantic prior: {describe_semantic_prior(margs)}; '
-             f'anchor mining: {arg(margs, "hard_mining")}; subset **{subset}**; test tiles: {res["n_test"]}; '
-             f'selected weights: {res["weights"]}; main setting: {MODE_LABELS[main_mode]} at decision threshold '
+             f'anchor mining: {arg(margs, "hard_mining")}; training precision: {run_precision(margs)}; '
+             f'subset **{subset}**; test tiles: {res["n_test"]}; '
+             f'selected weights: {res["weights"]}; main setting: {mode_label(main_mode)} at decision threshold '
              f't* = {res["threshold"]:.3f} ({res["threshold_source"]}).', '',
              'All values in %. F1 / IoU / P / R are for the **landslide** class (dataset-level pixel counts). '
              'mF1 = mean of landslide and background F1 (the "F1 score" reported by Xu et al. 2024); '
@@ -1188,15 +1364,19 @@ def results_markdown(res, subset):
              '| Method | Source | Same test split | P | R | F1 | IoU | mIoU | OA | mF1 | Kappa |',
              '|---|---|---|---|---|---|---|---|---|---|---|']
     if res.get('tta'):
-        ours = [('test_noTTA@0.5', 'no TTA, t=0.5'), ('test_TTA@0.5', 'D4-TTA, t=0.5'), ('test_TTA@t*', 'D4-TTA, t=t*'),
-                ('test_MSTTA@0.5', 'D4+MS-TTA, t=0.5'), ('test_MSTTA@t*', 'D4+MS-TTA, t=t*')]
+        base = [('noTTA@0.5', 'no TTA, t=0.5'), ('TTA@0.5', 'D4-TTA, t=0.5'), ('TTA@t*', 'D4-TTA, t=t*'),
+                ('MSTTA@0.5', 'D4+MS-TTA, t=0.5'), ('MSTTA@t*', 'D4+MS-TTA, t=t*')]
     else:
-        ours = [('test_noTTA@0.5', 'no TTA, t=0.5'), ('test_noTTA@t*', 'no TTA, t=t*')]
+        base = [('noTTA@0.5', 'no TTA, t=0.5'), ('noTTA@t*', 'no TTA, t=t*')]
+    ours = [(f'test_{k}', lab) for k, lab in base]
+    if res.get('lite_key'):  # the same model without the foundation model at inference
+        ours += [(f'test_{k.replace("@", LITE + "@")}', lab + ', no FM at inference') for k, lab in base]
     for key, label in ours:
         m = res.get(key)
         if m is None:
             continue
-        label = f'Ours, {label}' + (' (main)' if key == res.get('main_key') else '')
+        mark = ' (main)' if key == res.get('main_key') else (' (main, no FM)' if key == res.get('lite_key') else '')
+        label = f'Ours, {label}{mark}'
         lines.append(f'| **{label}** | this work | yes | {100 * m["precision"]:.2f} | {100 * m["recall"]:.2f} | '
                      f'{100 * m["f1"]:.2f} | **{100 * m["iou"]:.2f}** | {100 * m["miou"]:.2f} | {100 * m["oa"]:.2f} | '
                      f'{100 * m["mf1"]:.2f} | {100 * m["kappa"]:.2f} |')
@@ -1218,29 +1398,41 @@ def results_markdown(res, subset):
             lines.append(f'| {rg} | {m["tiles"]} | {100 * m["precision"]:.2f} | {100 * m["recall"]:.2f} | '
                          f'{100 * m["f1"]:.2f} | {100 * m["iou"]:.2f} |')
         lines.append('')
-    val_modes = [m for m in ('TTA', 'MSTTA', 'noTTA') if res.get(f'val_{m}@0.5')]
+    if res.get('lite_key') and (res.get('per_region_by_mode') or {}).get(res['tta_mode_lite']):
+        lines += ['## Per-region test metrics (main setting without the foundation model)', '',
+                  '| Region | tiles | P | R | F1 | IoU |', '|---|---|---|---|---|---|']
+        for rg, m in res['per_region_by_mode'][res['tta_mode_lite']].items():
+            lines.append(f'| {rg} | {m["tiles"]} | {100 * m["precision"]:.2f} | {100 * m["recall"]:.2f} | '
+                         f'{100 * m["f1"]:.2f} | {100 * m["iou"]:.2f} |')
+        lines.append('')
+    val_modes = [m + s for s in ('', LITE) for m in ('TTA', 'MSTTA', 'noTTA') if res.get(f'val_{m}{s}@0.5')]
     if not val_modes and res.get('val_at_0.5'):  # results written by the SP-UNet version
         res = {**res, f'val_{main_mode}@0.5': res['val_at_0.5'], f'val_{main_mode}@t*': res.get('val_at_t*')}
         val_modes = [main_mode]
     for m in val_modes:
         v, vt = res[f'val_{m}@0.5'], res.get(f'val_{m}@t*') or res[f'val_{m}@0.5']
         t_m = (res.get('thresholds') or {}).get(m, res['threshold'])
-        lines.append(f'Validation ({res["n_val"]} tiles, {MODE_LABELS[m]}): IoU {100 * v["iou"]:.2f} / '
+        lines.append(f'Validation ({res["n_val"]} tiles, {mode_label(m)}): IoU {100 * v["iou"]:.2f} / '
                      f'F1 {100 * v["f1"]:.2f} at t=0.5; IoU {100 * vt["iou"]:.2f} / F1 {100 * vt["f1"]:.2f} '
                      f'at t*={t_m:.3f}.')
     if val_modes:
         lines.append('')
-    st = res.get('model_stats') or {}
-    if st:
-        size = arg(margs, 'img_size')
-        txt = (f'Model: {st.get("params_M", 0):.2f} M trainable parameters (incl. '
-               f'{st.get("train_only_heads_M", 0):.2f} M in training-only heads)')
+    size = arg(margs, 'img_size')
+    for key, what in (('model_stats', 'Model'), ('model_stats_lite', 'Without the foundation model')):
+        st = res.get(key) or {}
+        if not st or 'params_M' not in st:
+            continue
+        lite = key.endswith('lite')
+        txt = f'{what}: {st.get("params_M", 0):.2f} M trainable parameters (incl. {st.get("train_only_heads_M", 0):.2f} M ' \
+              'in training-only heads)'
         if st.get('fm_frozen_params_M'):
-            txt += f' + {st["fm_frozen_params_M"]:.1f} M frozen foundation-model parameters'
+            txt += f' + {st["fm_frozen_params_M"]:.1f} M frozen foundation-model parameters' + (
+                ' (used only in training here)' if lite else '')
         if st.get('fm_training_only_params_M'):
             txt += f' (+ {st["fm_training_only_params_M"]:.1f} M frozen foundation-model parameters used only in training)'
-        if 'inference_params_M' in st:
-            txt += f'; {st["inference_params_M"]:.2f} M parameters used at inference'
+        pk = 'inference_params_lite_M' if lite else 'inference_params_M'
+        if pk in st:
+            txt += f'; {st[pk]:.2f} M parameters used at inference'
         txt += (f'; {st.get("gmacs", float("nan")):.1f} GMACs / {st.get("gflops", float("nan")):.1f} GFLOPs '
                 f'at {size}x{size}')
         if 'fps_batch8' in st:
@@ -1266,74 +1458,100 @@ def write_per_tile(path, rows, tiles):
     os.replace(tmp, path)
 
 
+def inference_variants(model):
+    """[(mode suffix, prior)]: models that need the foundation model but were trained with prior substitution
+    are evaluated with it ('full') and without it ('lite'); every other model once with its default."""
+    if getattr(model, 'needs_fm', False) and getattr(model, 'lite_capable', False):
+        return [('', 'full'), (LITE, 'lite')]
+    return [('', None)]
+
+
 def final_evaluation(a, d, model, rows, loaders, out_dir, info):
-    """TTA mode and threshold chosen on validation (if allowed); test with no TTA, D4-TTA and (--ms-tta)
-    D4+MS-TTA in one pass; per-region and per-tile counts; results.json / results.md / per_tile_test.csv."""
+    """Per inference variant (with / without the foundation model): TTA mode and threshold chosen on validation
+    (if allowed); test with no TTA, D4-TTA and (--ms-tta) D4+MS-TTA in one pass; per-region and per-tile counts;
+    results.json / results.md / per_tile_test.csv."""
     use_tta = not a.no_tta
     ms = use_tta and bool(arg(a, 'ms_tta'))
-    sel_modes = (['TTA'] + (['MSTTA'] if ms else [])) if use_tta else ['noTTA']
+    sel_base = (['TTA'] + (['MSTTA'] if ms else [])) if use_tta else ['noTTA']
     regions = sorted({r['region'] for r in rows['test']})
     rid_map = {rg: i for i, rg in enumerate(regions)}
     test_rids = torch.tensor([rid_map[r['region']] for r in rows['test']], dtype=torch.long)
+    n_tiles = {rg: sum(1 for r in rows['test'] if r['region'] == rg) for rg in regions}
     res = {'run': out_dir.name, 'tag': arg(a, 'tag') or out_dir.name, 'args': vars(a),
            'n_test': len(rows['test']), 'n_val': len(rows['val']), **info}
-    thr = {m: float(a.threshold) for m in sel_modes}
-    thr_src, val_best = 'fixed (--threshold)', {}
-    if loaders.get('val') is not None and info.get('select_threshold', False):
-        ev = evaluate(model, loaders['val'], d, a, modes=sel_modes,
-                      thresholds={m: SWEEP_THRESHOLDS for m in sel_modes})
-        i05 = SWEEP_THRESHOLDS.index(0.5)
+    variants = inference_variants(model)
+    res['inference_variants'] = [p or 'default' for _, p in variants]
+    thr, tiles_all, thr_src = {}, {}, 'fixed (--threshold)'
+    for vi, (sfx, prior) in enumerate(variants):
+        sel_modes = [m + sfx for m in sel_base]
         for m in sel_modes:
-            c = ev['counts'][m]
-            sweep = [metrics_from_counts(*c[i].tolist()) for i in range(len(SWEEP_THRESHOLDS))]
-            best = max(range(len(SWEEP_THRESHOLDS)),
-                       key=lambda i: (round(sweep[i]['iou'], 6), -abs(SWEEP_THRESHOLDS[i] - 0.5)))
-            thr[m], val_best[m] = float(SWEEP_THRESHOLDS[best]), sweep[best]['iou']
-            res[f'val_sweep_{m}'] = {f'{t:.3f}': {'iou': s['iou'], 'f1': s['f1']}
-                                     for t, s in zip(SWEEP_THRESHOLDS, sweep)}
-            res[f'val_{m}@0.5'], res[f'val_{m}@t*'] = sweep[i05], sweep[best]
-        m0 = sel_modes[0]
-        res['val_sweep'], res['val_at_0.5'], res['val_at_t*'] = (res[f'val_sweep_{m0}'], res[f'val_{m0}@0.5'],
-                                                                 res[f'val_{m0}@t*'])
-        thr_src = 'best validation IoU' + (' with TTA' if use_tta else '')
-    main = sel_modes[0]
-    if ms and val_best and val_best['MSTTA'] > val_best['TTA']:
-        main = 'MSTTA'
-    if ms:
-        res['tta_mode_source'] = ('D4+MS-TTA beat D4-TTA on validation' if main == 'MSTTA' else
-                                  'D4-TTA >= D4+MS-TTA on validation' if val_best else
-                                  'D4-TTA (no validation split to choose on)')
-    res['threshold'], res['threshold_source'], res['thresholds'] = thr[main], thr_src, dict(thr)
-    log(d, f'[eval] main setting {MODE_LABELS[main]}, decision threshold t* = {thr[main]:.3f} ({thr_src})')
-    test_modes = (['noTTA'] if use_tta else []) + sel_modes
-    ths = {m: _ths(thr.get(m, thr[sel_modes[0]])) for m in test_modes}  # no-TTA rows use the TTA threshold
-    sink = VisSink(out_dir / 'vis_test', rows['test'], a.save_vis, thr[main], d.main)
-    ev = evaluate(model, loaders['test'], d, a, modes=test_modes, thresholds=ths, region_ids=test_rids,
-                  n_regions=len(regions), sink=sink, sink_mode=main, per_tile=True)
-    for m in test_modes:
-        c = ev['counts'][m]
-        res[f'test_{m}@0.5'] = metrics_from_counts(*c[0].tolist())
-        res[f'test_{m}@t*'] = metrics_from_counts(*c[-1].tolist())
-    res['tta'], res['tta_mode'] = use_tta, main
-    res['main_key'] = f'test_{main}@t*'
-    res['main'] = res[res['main_key']]
-    res['ablation_key'] = f'test_{sel_modes[0]}@t*'  # the same setting for every ablation row
-    n_tiles = {rg: sum(1 for r in rows['test'] if r['region'] == rg) for rg in regions}
-    res['per_region_by_mode'] = {}
-    for m in test_modes:
-        pr = {}
-        for rg, i in rid_map.items():
-            pr[rg] = metrics_from_counts(*ev['regions'][m][i, -1].tolist())
-            pr[rg]['tiles'] = int(n_tiles[rg])
-        res['per_region_by_mode'][m] = pr
-    res['per_region'] = res['per_region_by_mode'][main]
+            thr[m] = float(a.threshold)
+        val_best = {}
+        if loaders.get('val') is not None and info.get('select_threshold', False):
+            ev = evaluate(model, loaders['val'], d, a, modes=sel_base,
+                          thresholds={m: SWEEP_THRESHOLDS for m in sel_base}, prior=prior)
+            i05 = SWEEP_THRESHOLDS.index(0.5)
+            for mb, m in zip(sel_base, sel_modes):
+                c = ev['counts'][mb]
+                sweep = [metrics_from_counts(*c[i].tolist()) for i in range(len(SWEEP_THRESHOLDS))]
+                best = max(range(len(SWEEP_THRESHOLDS)),
+                           key=lambda i: (round(sweep[i]['iou'], 6), -abs(SWEEP_THRESHOLDS[i] - 0.5)))
+                thr[m], val_best[mb] = float(SWEEP_THRESHOLDS[best]), sweep[best]['iou']
+                res[f'val_sweep_{m}'] = {f'{t:.3f}': {'iou': s['iou'], 'f1': s['f1']}
+                                         for t, s in zip(SWEEP_THRESHOLDS, sweep)}
+                res[f'val_{m}@0.5'], res[f'val_{m}@t*'] = sweep[i05], sweep[best]
+            if vi == 0:
+                m0 = sel_modes[0]
+                res['val_sweep'], res['val_at_0.5'], res['val_at_t*'] = (res[f'val_sweep_{m0}'], res[f'val_{m0}@0.5'],
+                                                                         res[f'val_{m0}@t*'])
+            thr_src = 'best validation IoU' + (' with TTA' if use_tta else '')
+        main_b = sel_base[0]
+        if ms and val_best and val_best['MSTTA'] > val_best['TTA']:
+            main_b = 'MSTTA'
+        main = main_b + sfx
+        if ms:
+            res['tta_mode_source' + sfx.replace('-', '_')] = (
+                'D4+MS-TTA beat D4-TTA on validation' if main_b == 'MSTTA' else
+                'D4-TTA >= D4+MS-TTA on validation' if val_best else 'D4-TTA (no validation split to choose on)')
+        log(d, f'[eval] {"main" if vi == 0 else "lite"} setting {mode_label(main)}, decision threshold '
+               f't* = {thr[main]:.3f} ({thr_src})')
+        test_base = (['noTTA'] if use_tta else []) + sel_base
+        ths = {mb: _ths(thr.get(mb + sfx, thr[sel_modes[0]])) for mb in test_base}  # no-TTA uses the TTA threshold
+        sink = VisSink(out_dir / 'vis_test', rows['test'], a.save_vis, thr[main], d.main and vi == 0)
+        ev = evaluate(model, loaders['test'], d, a, modes=test_base, thresholds=ths, region_ids=test_rids,
+                      n_regions=len(regions), sink=sink, sink_mode=main_b, per_tile=True, prior=prior)
+        for mb in test_base:
+            m = mb + sfx
+            c = ev['counts'][mb]
+            res[f'test_{m}@0.5'] = metrics_from_counts(*c[0].tolist())
+            res[f'test_{m}@t*'] = metrics_from_counts(*c[-1].tolist())
+            tiles_all[m] = ev['tiles'][mb]
+            pr = {}
+            for rg, i in rid_map.items():
+                pr[rg] = metrics_from_counts(*ev['regions'][mb][i, -1].tolist())
+                pr[rg]['tiles'] = int(n_tiles[rg])
+            res.setdefault('per_region_by_mode', {})[m] = pr
+        if vi == 0:
+            res['tta'], res['tta_mode'] = use_tta, main
+            res['threshold'], res['threshold_source'] = thr[main], thr_src
+            res['main_key'] = f'test_{main}@t*'
+            res['main'] = res[res['main_key']]
+            res['ablation_key'] = f'test_{sel_modes[0]}@t*'  # the same setting for every ablation row
+            res['per_region'] = res['per_region_by_mode'][main]
+        else:
+            res['tta_mode_lite'], res['threshold_lite'] = main, thr[main]
+            res['lite_key'] = f'test_{main}@t*'
+            res['lite'] = res[res['lite_key']]
+            res['lite_ablation_key'] = f'test_{sel_modes[0]}@t*'
+    res['thresholds'] = dict(thr)
     if d.main:
-        write_per_tile(out_dir / 'per_tile_test.csv', rows['test'], ev['tiles'])
+        write_per_tile(out_dir / 'per_tile_test.csv', rows['test'], tiles_all)
         res['per_tile_file'] = 'per_tile_test.csv'
-        try:
-            res['model_stats'] = model_stats(model, a.img_size, d.device, a.amp, a.channels_last)
-        except Exception as e:  # noqa: BLE001
-            res['model_stats'] = {'error': str(e)[:200]}
+        for key, prior in (('model_stats', variants[0][1]),) + ((('model_stats_lite', 'lite'),) if len(variants) > 1 else ()):
+            try:
+                res[key] = model_stats(model, a.img_size, d.device, a.amp, a.channels_last, prior=prior)
+            except Exception as e:  # noqa: BLE001
+                res[key] = {'error': str(e)[:200]}
         subset = info.get('subset', 'SAT')
         write_json(res, out_dir / 'results.json')
         md = results_markdown(res, subset)
@@ -1375,9 +1593,18 @@ def parse_args(argv=None):
                    help='FM input size for img-size tiles (0 = img-size; rounded to the patch size), e.g. 384')
     g.add_argument('--fm-layers', type=int, default=4, help='evenly spaced ViT blocks whose features are used')
     g.add_argument('--fm-channels', type=int, default=256, help='width of the FM adapter')
-    g.add_argument('--hard-mining', choices=['auto', 'error', 'fm', 'error+fm', 'random'], default='auto',
-                   help="anchor mining of the pixel contrastive loss; auto = 'error+fm' with a foundation model, "
-                        "otherwise 'error'")
+    g.add_argument('--fm-sub', choices=['none', 'zero', 'hal'], default='hal',
+                   help="prior substitution during training (--fm-mode fuse): for a random --fm-sub-p fraction of "
+                        "every batch the real prior is replaced by nothing ('zero' = prior dropout) or by the prior "
+                        "the network hallucinates from its own features ('hal'); 'none' = v1 DPF-Net. zero / hal "
+                        "models are also evaluated without the foundation model ('lite')")
+    g.add_argument('--fm-sub-p', type=float, default=0.5, help='fraction of each batch with a substituted prior')
+    g.add_argument('--hal-weight', type=float, default=0.5, help='weight of the prior-hallucination loss')
+    g.add_argument('--select-prior', choices=['full', 'lite'], default='full',
+                   help='checkpoint selection on validation with (full) or without (lite) the foundation model')
+    g.add_argument('--hard-mining', choices=['auto', 'error', 'fm', 'error+fm', 'random'], default='error',
+                   help="anchor mining of the pixel contrastive loss ('fm' / 'error+fm' use the foundation model; "
+                        "auto = v1 default: 'error+fm' with a foundation model, otherwise 'error')")
     g.add_argument('--distill-weight', type=float, default=0.5, help='feature-distillation weight (--fm-mode distill)')
     g = p.add_argument_group('training')
     g.add_argument('--img-size', type=int, default=512)
@@ -1391,7 +1618,14 @@ def parse_args(argv=None):
     g.add_argument('--min-lr-ratio', type=float, default=0.01)
     g.add_argument('--ema-decay', type=float, default=0.9995)
     g.add_argument('--clip-grad', type=float, default=1.0)
-    g.add_argument('--no-amp', action='store_true')
+    g.add_argument('--precision', choices=['auto', 'fp16', 'fp32'], default='auto',
+                   help='auto: FP16 autocast, a step whose FP16 forward overflows is restored and recomputed in FP32 '
+                        '(and a run with frequent overflows switches to FP32); fp16: plain FP16 autocast (v1, can '
+                        'diverge); fp32: no autocast (about 3.5x slower on a T4)')
+    g.add_argument('--no-amp', action='store_true', help='same as --precision fp32')
+    g.add_argument('--fp32-switch-frac', type=float, default=0.05,
+                   help='--precision auto: switch to FP32 after an epoch with more FP32 recomputes than this fraction')
+    g.add_argument('--debug-overflow-every', type=int, default=0, help=argparse.SUPPRESS)  # tests: fake FP16 overflows
     g.add_argument('--no-channels-last', action='store_true')
     g.add_argument('--seed', type=int, default=42)
     g.add_argument('--full-train', action='store_true',
@@ -1444,7 +1678,18 @@ def parse_args(argv=None):
         p.error('--fm-mode distill needs a foundation model (--fm)')
     if a.fm_size < 0 or a.fm_layers < 1 or a.fm_channels < 8:
         p.error('--fm-size must be >= 0, --fm-layers >= 1, --fm-channels >= 8')
-    a.amp = (not a.no_amp) and torch.cuda.is_available()
+    if not fm_enabled(a.fm) or a.fm_mode != 'fuse':
+        a.fm_sub = 'none'  # substitution only exists for the fused prior
+    if not 0.0 <= a.fm_sub_p < 1.0:
+        p.error('--fm-sub-p must be in [0, 1)')
+    if a.fm_sub != 'hal':
+        a.hal_weight = 0.0
+    if a.select_prior == 'lite' and a.fm_sub == 'none':
+        a.select_prior = 'full'
+    if a.no_amp:
+        a.precision = 'fp32'
+    a.no_amp = a.precision == 'fp32'
+    a.amp = a.precision != 'fp32' and torch.cuda.is_available()
     a.channels_last = (not a.no_channels_last) and torch.cuda.is_available()
     return a
 
@@ -1526,6 +1771,13 @@ def train(a, d, rows, subset, out_dir):
     ema = ModelEMA(model, a.ema_decay)
     optimizer = build_optimizer(model, a)
     scaler = torch.amp.GradScaler(d.device.type, enabled=a.amp)
+    # --precision auto: BatchNorm running statistics are snapshotted before every FP16 forward, so a step whose
+    # FP16 forward overflows can be undone (the statistics, and through them the EMA, never see inf / NaN)
+    bn_bufs = [b for m in model.modules() if isinstance(m, nn.modules.batchnorm._BatchNorm)
+               for b in (m.running_mean, m.running_var, m.num_batches_tracked) if b is not None]
+    guard = arg(a, 'precision') == 'auto' and (a.amp or a.debug_overflow_every > 0)  # (tests: also on CPU)
+    fp32_now, fp32_total = False, 0
+    dual = model.needs_fm and model.lite_capable  # validate with and without the foundation model
 
     # ---- data ----
     ds_train = SegDataset(rows['train'], a.img_size, train=True)
@@ -1546,9 +1798,13 @@ def train(a, d, rows, subset, out_dir):
     if a.resume:
         ck = torch.load(a.resume, map_location='cpu', weights_only=True)
         old = ck['args']
-        for k in ARCH_KEYS + ('full_train', 'hard_mining'):
+        for k in ARCH_KEYS + ('full_train', 'hard_mining', 'fm_sub_p', 'hal_weight'):
             if arg(old, k) != arg(a, k):
                 raise SystemExit(f'--resume: argument "{k}" differs ({arg(old, k)} vs {arg(a, k)}).')
+        if run_precision(old) != run_precision(a):
+            log(d, f'WARNING: --resume with precision {run_precision(a)} (checkpoint run: {run_precision(old)}).')
+        ps = ck.get('precision_state') or {}
+        fp32_now, fp32_total = bool(ps.get('fp32_now', False)), int(ps.get('fp32_recomputes', 0))
         for k in ('boundary_weight', 'contrast_weight'):
             if (old.get(k, 0) > 0) != (getattr(a, k) > 0):
                 raise SystemExit(f'--resume: head "{k}" enabled/disabled differently from the checkpoint.')
@@ -1592,7 +1848,8 @@ def train(a, d, rows, subset, out_dir):
               f'blocks {model.fm_idx}, input scale {model.fm_scale:g}' if model.fm_name else ''))
     log(d, f'[train] tiles train/val/test = {len(rows["train"])}/{len(rows["val"])}/{len(rows["test"])} | '
            f'world {d.world} x batch {a.batch_size} = {d.world * a.batch_size} | {steps_per_epoch} steps/epoch | '
-           f'{a.epochs} epochs | AMP {a.amp} | channels_last {a.channels_last} | device {d.device}')
+           f'{a.epochs} epochs | precision {run_precision(a)} (AMP {a.amp}{", FP32 since resume" if fp32_now else ""})'
+           f' | channels_last {a.channels_last} | device {d.device}')
 
     epoch_times, stopped_early = list(prev_times), False  # previous session's epoch times seed the time guard
     names = ['loss', 'seg', 'aux4', 'aux8', 'bnd', 'con', 'dis']
@@ -1609,7 +1866,7 @@ def train(a, d, rows, subset, out_dir):
         net.train()
         acc = torch.zeros(len(names), device=d.device, dtype=torch.float64)
         n_ok = torch.zeros((), device=d.device, dtype=torch.float64)
-        n_skip = 0
+        n_skip = n_fp32 = 0
         for it, (img, mask, _) in enumerate(dl_train):
             x = img.to(d.device, non_blocking=True).float().div_(255.0)
             y = mask.to(d.device, non_blocking=True).float()
@@ -1619,9 +1876,24 @@ def train(a, d, rows, subset, out_dir):
             f = lr_factor(step, total_steps, warmup_steps, a.min_lr_ratio)
             for gr in optimizer.param_groups:
                 gr['lr'] = gr['base_lr'] * f
-            with torch.autocast(device_type=d.device.type, dtype=torch.float16, enabled=a.amp):
+            use16 = a.amp and not fp32_now
+            snap = [b.clone() for b in bn_bufs] if (guard and not fp32_now) else None
+            with torch.autocast(device_type=d.device.type, dtype=torch.float16, enabled=use16):
                 out = net(x)
             loss, parts = compute_loss(out, y, a)
+            if snap is not None:
+                bad = not bool(torch.isfinite(loss))
+                if a.debug_overflow_every and (step + 1) % a.debug_overflow_every == 0:
+                    bad = True  # tests: behave as if the FP16 forward had overflowed
+                if d.any_flag(bad):  # every rank recomputes (SyncBN / DDP stay in step)
+                    del out, loss, parts
+                    with torch.no_grad():
+                        for b, s in zip(bn_bufs, snap):
+                            b.copy_(s)
+                    with torch.autocast(device_type=d.device.type, enabled=False):
+                        out = net(x)
+                    loss, parts = compute_loss(out, y, a)
+                    n_fp32 += 1
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
             if a.clip_grad > 0:
@@ -1647,42 +1919,61 @@ def train(a, d, rows, subset, out_dir):
         d.sum_(n_ok)
         tr = {k: v for k, v in zip(names, (acc / n_ok.clamp(min=1)).tolist())}
 
-        val_m = None
+        fp32_total += n_fp32
+        switched = False
+        if guard and not fp32_now and n_fp32 > max(2, a.fp32_switch_frac * steps_per_epoch):
+            fp32_now = switched = True  # frequent FP16 overflows: finish the run in FP32
+            log(d, f'[train] {n_fp32} FP16 overflows in epoch {epoch + 1}: the remaining epochs run in FP32')
+
+        val_m = val_lite = None
         if dl_val is not None and ((epoch + 1) % a.val_every == 0 or epoch + 1 == a.epochs):
-            c = evaluate(ema.module, dl_val, d, a, modes=('noTTA',))['counts']['noTTA']
+            c = evaluate(ema.module, dl_val, d, a, modes=('noTTA',), prior='full' if dual else None)['counts']['noTTA']
             val_m = metrics_from_counts(*c[0].tolist())
+            if dual:
+                c = evaluate(ema.module, dl_val, d, a, modes=('noTTA',), prior='lite')['counts']['noTTA']
+                val_lite = metrics_from_counts(*c[0].tolist())
         test_m = None
         if dl_test_track is not None:
             c = evaluate(ema.module, dl_test_track, d, a, modes=('noTTA',))['counts']['noTTA']
             test_m = metrics_from_counts(*c[0].tolist())
-        improved = val_m is not None and val_m['iou'] > best_iou
+        sel = val_lite if (dual and arg(a, 'select_prior') == 'lite') else val_m
+        improved = sel is not None and sel['iou'] > best_iou
         if improved:
-            best_iou, best_epoch = val_m['iou'], epoch + 1
+            best_iou, best_epoch = sel['iou'], epoch + 1
         epoch_times.append(time.time() - t_ep)
         rec = {'epoch': epoch + 1, 'lr_dec': optimizer.param_groups[0]['lr'], 'train': tr,
                'amp_skipped_steps': n_skip, 'amp_scale': scaler.get_scale() if a.amp else None,
-               'val': val_m, 'test_tracked': test_m, 'seconds': epoch_times[-1]}
+               'fp32_recomputes': n_fp32, 'fp32_mode': fp32_now,
+               'val': val_m, 'val_lite': val_lite, 'test_tracked': test_m, 'seconds': epoch_times[-1]}
         history.append(rec)
         if d.main:
             if improved:
-                save_atomic({'model': ema.module.state_dict(), 'args': vars(a), 'epoch': epoch + 1, 'val': val_m,
-                             'split_hash': split_h}, out_dir / 'best.pth')
+                save_atomic({'model': ema.module.state_dict(), 'args': vars(a), 'epoch': epoch + 1, 'val': sel,
+                             'val_full': val_m, 'val_lite': val_lite, 'split_hash': split_h}, out_dir / 'best.pth')
             save_atomic({'model': model.state_dict(), 'ema': ema.state_dict(), 'optimizer': optimizer.state_dict(),
                          'scaler': scaler.state_dict() if a.amp else None, 'epoch': epoch + 1, 'step': step,
                          'best_iou': best_iou, 'best_epoch': best_epoch, 'history': history,
+                         'precision_state': {'fp32_now': fp32_now, 'fp32_recomputes': fp32_total},
                          'args': {**vars(a), 'steps_per_epoch': steps_per_epoch}, 'split_hash': split_h},
                         out_dir / 'last.pth')
             write_json(history, out_dir / 'history.json')
+            has_dis = model.distill_head is not None or model.hal is not None
             msg = (f'[ep {epoch + 1:3d}/{a.epochs}] loss {tr["loss"]:.4f} (seg {tr["seg"]:.4f} bnd {tr["bnd"]:.4f} '
-                   f'con {tr["con"]:.4f}' + (f' dis {tr["dis"]:.4f}' if model.distill_head is not None else '')
+                   f'con {tr["con"]:.4f}' + (f' {"hal" if model.hal is not None else "dis"} {tr["dis"]:.4f}'
+                                              if has_dis else '')
                    + f') lr {optimizer.param_groups[0]["lr"]:.2e}')
             if val_m:
                 msg += (f' | val IoU {100 * val_m["iou"]:.2f} F1 {100 * val_m["f1"]:.2f} P {100 * val_m["precision"]:.1f} '
-                        f'R {100 * val_m["recall"]:.1f} | best {100 * best_iou:.2f}@{best_epoch}')
+                        f'R {100 * val_m["recall"]:.1f}')
+                if val_lite:
+                    msg += f' | no-FM val IoU {100 * val_lite["iou"]:.2f}'
+                msg += f' | best {100 * best_iou:.2f}@{best_epoch}'
             if test_m:
                 msg += f' | test(track) IoU {100 * test_m["iou"]:.2f}'
             if n_skip:
                 msg += f' | amp-skipped {n_skip}'
+            if n_fp32:
+                msg += f' | FP32 recomputes {n_fp32}' + (' -> FP32 from now on' if switched else '')
             if model.fm_fallbacks:
                 msg += f' | FM FP32 fallbacks {model.fm_fallbacks}'
             mean_ep = float(np.mean(epoch_times[-3:]))
